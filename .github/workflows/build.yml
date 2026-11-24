@@ -38,8 +38,17 @@ jobs:
       - name: Rust (stable)
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Кэш cargo
-        uses: Swatinem/rust-cache@v2
+      - name: Кэш cargo (registry)
+        uses: actions/cache@v4
+        with:
+          # Кэшируем только реестр, без target: сохранение target на Windows
+          # занимает десятки минут и тормозит весь job. Сборка и так ~3 минуты.
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
 
       - name: Сборка
         run: cargo build --release --locked
