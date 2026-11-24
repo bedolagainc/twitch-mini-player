@@ -41,7 +41,9 @@
 - **Установщик** (`installer\twitch_mini_player.iss`, Inno Setup 6): ставится без
   прав администратора в `%LOCALAPPDATA%\Programs\Mini Twitch Player`, сразу с
   `libmpv`, `streamlink`, распознаванием и переводом. CI собирает `setup.exe` и
-  портативный zip и прикрепляет к релизу оба файла.
+  портативный zip и прикрепляет к релизу оба файла. `streamlink` ставится в
+  `%LOCALAPPDATA%\Programs\Streamlink` — путь, который плеер ищет без настройки;
+  уже установленный Streamlink не перезаписывается.
 - `scripts\fetch-vendor.ps1` — собирает внешние бинарники для установщика в
   `vendor\` (libmpv, streamlink, whisper.cpp, модели) с проверкой SHA-256; если
   GitHub недоступен, `streamlink` берётся из системной установки.
@@ -65,7 +67,8 @@
   на нуле при обычной речи и оживала только у самых громких пиков.
 - Метаданные пакета для публикации: `description`, `license = "MIT"`,
   `repository`, `readme`, `publish = false`.
-- Репозиторий опубликован: <https://github.com/bedolagainc/twitch-mini-player>.
+- Репозиторий опубликован: <https://github.com/bedolagainc/twitch-mini-player>
+  (прежний адрес `danil200215/...` — редирект GitHub), ссылки в проекте обновлены.
 
 ## [0.18.0] — 2026-11-24
 

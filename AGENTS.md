@@ -34,7 +34,10 @@
 ```powershell
 cargo build --release --locked
 powershell -ExecutionPolicy Bypass -File scripts\fetch-vendor.ps1
-& 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe' /DMyAppVersion=0.18.0 installer\twitch_mini_player.iss
+
+# ISCC лежит в папке Inno Setup 6: Program Files (x86) или %LOCALAPPDATA%\Programs
+$iscc = 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe'
+& $iscc /DMyAppVersion=0.18.0 installer\twitch_mini_player.iss
 # результат: dist\twitch_mini_player-0.18.0-setup.exe
 ```
 
