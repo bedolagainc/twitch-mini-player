@@ -17,6 +17,11 @@
 
 ## [Unreleased]
 
+### Изменено
+- Метаданные пакета для публикации: `description`, `license = "MIT"`,
+  `repository`, `readme`, `publish = false`.
+- Репозиторий опубликован: <https://github.com/danil200215/twitch-mini-player>.
+
 ## [0.18.0] — 2026-11-24
 
 ### Добавлено

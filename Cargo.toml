@@ -2,6 +2,12 @@
 name = "twitch_mini_player"
 version = "0.18.0"
 edition = "2021"
+description = "Минималистичный плеер Twitch-каналов: mpv + egui, оверлей, трей, запись и захват звука процесса"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/danil200215/twitch-mini-player"
+# Бинарное приложение, в crates.io не публикуется.
+publish = false
 
 [dependencies]
 eframe = "0.28"
