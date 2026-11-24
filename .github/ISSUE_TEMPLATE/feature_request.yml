@@ -1,0 +1,52 @@
+name: Предложение
+description: Идея новой функции или улучшения
+title: '[idea] '
+labels: ['enhancement']
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Какую задачу это решает
+      description: Опишите ситуацию, а не готовое решение — так проще выбрать лучший вариант.
+      placeholder: 'Смотрю ночью, хочется быстро приглушить звук до нуля…'
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Как это могло бы работать
+      description: Поведение, горячие клавиши, где в интерфейсе.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Что уже пробовали / альтернативы
+    validations:
+      required: false
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Область
+      options:
+        - Воспроизведение и качество
+        - Окно, мышь, трей
+        - Консоль разработчика и настройки
+        - Субтитры и захват звука
+        - Сборка, релизы, документация
+        - Другое
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Перед отправкой
+      options:
+        - label: Поискал похожие предложения в issues
+          required: true
+        - label: Понимаю, что автор может отказать, если это тянет проект не в ту сторону
+          required: false

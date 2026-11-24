@@ -1,0 +1,72 @@
+name: Сообщение об ошибке
+description: Что-то работает не так — помогите это воспроизвести
+title: '[bug] '
+labels: ['bug']
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Спасибо за отчёт. Логи и версия сильно ускоряют починку — без них
+        приходится угадывать.
+
+  - type: input
+    id: version
+    attributes:
+      label: Версия плеера
+      description: 'Консоль разработчика (кнопка «Консоль») или Cargo.toml. Например: 0.18.0'
+      placeholder: '0.18.0'
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Windows
+      options:
+        - Windows 11
+        - Windows 10
+        - Windows Server / LTSC
+        - Другая (указать в описании)
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Как воспроизвести
+      description: По шагам — канал можно выдумать, важны действия.
+      placeholder: |
+        1. Запустить, ввести канал …
+        2. Переключить качество на 720p60
+        3. Через минуту картинка замирает
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Ожидаемое и фактическое поведение
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Логи
+      description: |
+        Паника — `%TEMP%\twitch_mini_player_crash.txt`.
+        Подробный лог включается переменной `TW_DEBUG_LOG=1` → `%TEMP%\twitch_mini_player_debug.txt`.
+        Секреты не присылайте: Client ID и настройки тут не нужны.
+      render: text
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Перед отправкой
+      options:
+        - label: Проверил, что `libmpv-2.dll` лежит рядом с `.exe` и `streamlink --version` работает
+          required: true
+        - label: Поискал похожие issues
+          required: true

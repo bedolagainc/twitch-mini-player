@@ -1,0 +1,91 @@
+name: build
+
+# Собирает Windows x64 и прогоняет тесты на каждый push/PR.
+# При пуше тега v* (или ручном запуске с указанием тега) кладёт zip с exe в Releases.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Тег релиза, к которому прикрепить zip (например, v0.18.0). Пусто — только сборка.'
+        required: false
+        type: string
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    name: Windows x64
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Кэш cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Сборка
+        run: cargo build --release --locked
+
+      - name: Тесты
+        run: cargo test --release --locked
+
+      - name: Упаковка
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ver = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
+          $name = "twitch_mini_player-$ver-windows-x64"
+          $dir = Join-Path 'dist' $name
+          New-Item -ItemType Directory -Force -Path "$dir/scripts" | Out-Null
+          Copy-Item 'target/release/twitch_mini_player.exe' $dir
+          Copy-Item 'README.md', 'LICENSE', 'CHANGELOG.md', 'FIRST-RUN.txt' $dir
+          Copy-Item 'scripts/fetch-whisper.ps1' "$dir/scripts"
+          Compress-Archive -Path $dir -DestinationPath "dist/$name.zip" -Force
+          "ZIP=dist/$name.zip" >> $env:GITHUB_ENV
+          "VER=$ver" >> $env:GITHUB_ENV
+          Get-ChildItem 'dist' | Format-Table Name, Length
+
+      - name: Артефакт сборки
+        uses: actions/upload-artifact@v4
+        with:
+          name: twitch_mini_player-windows-x64
+          path: dist/*.zip
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Публикация в Releases
+        if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.tag != '')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_INPUT: ${{ inputs.tag }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = if ($env:TAG_INPUT) { $env:TAG_INPUT } else { $env:GITHUB_REF_NAME }
+          Write-Host "Релиз: $tag (версия $env:VER)"
+
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $tag --title "twitch_mini_player $env:VER" --generate-notes
+          }
+
+          gh release upload $tag $env:ZIP --clobber
+          Write-Host 'Готово: zip прикреплён к релизу.'
