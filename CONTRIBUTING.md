@@ -4,9 +4,9 @@
 **баги и идеи — в issues, код — в pull request**. Отдельного «уровня доверия» нет:
 любой может форкнуть репозиторий, собрать и прислать PR.
 
-- Репозиторий: <https://github.com/danil200215/twitch-mini-player>
-- Issues: <https://github.com/danil200215/twitch-mini-player/issues>
-- Releases: <https://github.com/danil200215/twitch-mini-player/releases>
+- Репозиторий: <https://github.com/bedolagainc/twitch-mini-player>
+- Issues: <https://github.com/bedolagainc/twitch-mini-player/issues>
+- Releases: <https://github.com/bedolagainc/twitch-mini-player/releases>
 
 ## Быстрый старт
 
@@ -40,9 +40,10 @@ cargo build --release --locked
 cargo test --release --locked
 ```
 
-Ожидаемо: `20 passed; 0 failed; 2 ignored`. Два пропущенных теста сетевые/живые
-(`render_real_frame` — нужен `libmpv-2.dll`; `capture_live` — нужен реальный
-звук). Их можно запустить руками:
+Ожидаемо: `27 passed; 0 failed; 5 ignored`. Пропущенные тесты — живые
+(`render_real_frame` — нужен `libmpv-2.dll`; `capture_live` — реальный звук;
+`live_transcribes` и `live_translates` — модели распознавания и перевода).
+Их можно запустить руками:
 
 ```powershell
 cargo test --release -- --ignored --nocapture
@@ -87,10 +88,12 @@ GitHub Actions (`.github/workflows/build.yml`) на каждый push и PR:
 
 1. `cargo build --release --locked`
 2. `cargo test --release --locked`
-3. упаковка `twitch_mini_player-<версия>-windows-x64.zip` (артефакт)
+3. `scripts/fetch-vendor.ps1` — libmpv, streamlink, whisper.cpp, модели
+4. упаковка портативного `twitch_mini_player-<версия>-windows-x64.zip`
+5. сборка установщика `twitch_mini_player-<версия>-setup.exe` (Inno Setup 6)
 
-При пуше тега `v*` тот же zip автоматически прикрепляется к релизу — так
-появляются сборки в [Releases](https://github.com/danil200215/twitch-mini-player/releases).
+Оба файла — артефакты сборки. При пуше тега `v*` они прикрепляются к релизу —
+так появляются сборки в [Releases](https://github.com/bedolagainc/twitch-mini-player/releases).
 
 ## Если PR принят
 

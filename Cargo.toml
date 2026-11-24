@@ -5,7 +5,7 @@ edition = "2021"
 description = "Минималистичный плеер Twitch-каналов: mpv + egui, оверлей, трей, запись и захват звука процесса"
 license = "MIT"
 readme = "README.md"
-repository = "https://github.com/danil200215/twitch-mini-player"
+repository = "https://github.com/bedolagainc/twitch-mini-player"
 # Бинарное приложение, в crates.io не публикуется.
 publish = false
 
@@ -14,6 +14,13 @@ eframe = "0.28"
 reqwest = { version = "0.11", features = ["blocking", "json"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+# Локальный перевод en→ru (src/mt.rs): ONNX Runtime подгружается динамически
+# (`onnxruntime.dll` ставит установщик), токенизатор читает `tokenizer.json`.
+ort = { version = "2.0.0-rc.15", default-features = false, features = [
+    "load-dynamic",
+    "api-31",
+] }
+tokenizers = "0.23"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.48", features = [

@@ -29,7 +29,7 @@ jobs:
   windows:
     name: Windows x64
     runs-on: windows-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
 
     steps:
       - name: Checkout
@@ -56,6 +56,31 @@ jobs:
       - name: Тесты
         run: cargo test --release --locked
 
+      - name: Кэш внешних бинарников
+        uses: actions/cache@v4
+        with:
+          path: vendor
+          key: ${{ runner.os }}-vendor-${{ hashFiles('scripts/fetch-vendor.ps1', 'scripts/fetch-whisper.ps1', 'scripts/fetch-mt.ps1') }}
+          restore-keys: |
+            ${{ runner.os }}-vendor-
+
+      - name: Внешние бинарники (libmpv, streamlink, whisper, перевод)
+        shell: pwsh
+        run: ./scripts/fetch-vendor.ps1
+
+      - name: Установка Inno Setup
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          choco install innosetup --no-progress -y
+          $iscc = @(
+            'C:\Program Files (x86)\Inno Setup 6\ISCC.exe',
+            'C:\Program Files\Inno Setup 6\ISCC.exe'
+          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $iscc) { throw 'ISCC.exe не найден после установки' }
+          "ISCC=$iscc" >> $env:GITHUB_ENV
+          Write-Host "ISCC: $iscc"
+
       - name: Упаковка
         shell: pwsh
         run: |
@@ -63,20 +88,39 @@ jobs:
           $ver = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
           $name = "twitch_mini_player-$ver-windows-x64"
           $dir = Join-Path 'dist' $name
-          New-Item -ItemType Directory -Force -Path "$dir/scripts" | Out-Null
+          New-Item -ItemType Directory -Force -Path "$dir/scripts", "$dir/docs", `
+            "$dir/tools/whisper", "$dir/tools/onnx", "$dir/models/mt", "$dir/streamlink" | Out-Null
+
+          # Портативная версия: всё рядом с .exe, включая модели (не нужен %APPDATA%)
           Copy-Item 'target/release/twitch_mini_player.exe' $dir
+          Copy-Item 'vendor/libmpv/libmpv-2.dll' $dir
+          Copy-Item 'vendor/streamlink/*' "$dir/streamlink" -Recurse
+          Copy-Item 'vendor/whisper/*.dll' "$dir/tools/whisper"
+          Copy-Item 'vendor/onnx/onnxruntime.dll' "$dir/tools/onnx"
+          Copy-Item 'vendor/models/*.bin' "$dir/models"
+          Copy-Item 'vendor/mt/*' "$dir/models/mt"
           Copy-Item 'README.md', 'LICENSE', 'CHANGELOG.md', 'FIRST-RUN.txt' $dir
-          Copy-Item 'scripts/fetch-whisper.ps1' "$dir/scripts"
+          Copy-Item 'docs/*' "$dir/docs"
+          Copy-Item 'scripts/*.ps1' "$dir/scripts"
+
           Compress-Archive -Path $dir -DestinationPath "dist/$name.zip" -Force
+
+          # Установщик (Inno Setup): полный комплект, per-user
+          & $env:ISCC "/DMyAppVersion=$ver" 'installer/twitch_mini_player.iss'
+          if ($LASTEXITCODE -ne 0) { throw "ISCC вернул код $LASTEXITCODE" }
+
           "ZIP=dist/$name.zip" >> $env:GITHUB_ENV
+          "SETUP=dist/twitch_mini_player-$ver-setup.exe" >> $env:GITHUB_ENV
           "VER=$ver" >> $env:GITHUB_ENV
-          Get-ChildItem 'dist' | Format-Table Name, Length
+          Get-ChildItem 'dist' | Format-Table Name, Length -AutoSize
 
       - name: Артефакт сборки
         uses: actions/upload-artifact@v4
         with:
           name: twitch_mini_player-windows-x64
-          path: dist/*.zip
+          path: |
+            dist/*.zip
+            dist/*setup.exe
           if-no-files-found: error
           retention-days: 30
 
@@ -91,10 +135,21 @@ jobs:
           $tag = if ($env:TAG_INPUT) { $env:TAG_INPUT } else { $env:GITHUB_REF_NAME }
           Write-Host "Релиз: $tag (версия $env:VER)"
 
+          $notes = @(
+            "**Установщик (рекомендуется):** ``twitch_mini_player-$env:VER-setup.exe``"
+            "**Портативная версия:** ``twitch_mini_player-$env:VER-windows-x64.zip``"
+            ""
+            "Windows 10/11 x64. Установщик ставит всё сам (libmpv, streamlink, распознавание, перевод) и не требует прав администратора."
+            "Подробности — README.md, изменения — CHANGELOG.md."
+          ) -join "`n"
+
           gh release view $tag *> $null
           if ($LASTEXITCODE -ne 0) {
-            gh release create $tag --title "twitch_mini_player $env:VER" --generate-notes
+            gh release create $tag --title "Mini Twitch Player $env:VER" --notes $notes
+          } else {
+            Write-Host 'Релиз уже существует — обновляем файлы.'
           }
 
           gh release upload $tag $env:ZIP --clobber
-          Write-Host 'Готово: zip прикреплён к релизу.'
+          gh release upload $tag $env:SETUP --clobber
+          Write-Host 'Готово: zip и setup.exe прикреплены к релизу.'

@@ -1,11 +1,11 @@
 blank_issues_enabled: false
 contact_links:
   - name: Скачать готовую сборку
-    url: https://github.com/danil200215/twitch-mini-player/releases
+    url: https://github.com/bedolagainc/twitch-mini-player/releases
     about: exe собирается автоматически на GitHub Actions — ищите последний релиз.
   - name: Как предложить правку (CONTRIBUTING)
-    url: https://github.com/danil200215/twitch-mini-player/blob/main/CONTRIBUTING.md
+    url: https://github.com/bedolagainc/twitch-mini-player/blob/main/CONTRIBUTING.md
     about: Форк, ветка, тесты и PR — короткая инструкция с правилами проекта.
   - name: Проблемы с запуском (нет libmpv / streamlink)
-    url: https://github.com/danil200215/twitch-mini-player#требования
+    url: https://github.com/bedolagainc/twitch-mini-player#требования
     about: 'Сначала проверьте: libmpv-2.dll рядом с exe и streamlink --version.'

@@ -27,11 +27,45 @@
 - `FIRST-RUN.txt` — короткая инструкция первого запуска; кладётся в zip релиза.
 - README: разделы «Скачать готовую сборку» и «Участие: правки и сообщения об
   ошибках».
+- **Распознавание речи** (`src/asr.rs`): `whisper.dll` (whisper.cpp) грузится
+  динамически (как `libmpv-2.dll`), модель `ggml-base.en-q5_1` ищется в
+  `%APPDATA%\twitch_mini_player\models` и рядом с `.exe`, а в консоли появилась
+  кнопка «Распознать 10 с» — берёт последние секунды захвата и показывает текст.
+  CPU-бэкенды `ggml-cpu-*.dll` подключаются явно: официальная Windows-сборка
+  whisper.cpp сама их не подхватывает и падает на `GGML_ASSERT(device)`.
+- **Перевод en→ru** (`src/mt.rs`): MarianMT `opus-mt-en-ru` (int8) на ONNX
+  Runtime, локально и без интернета; рядом с распознанным текстом появилась
+  кнопка «Перевести». `scripts\fetch-mt.ps1` скачивает модель (~105 МБ) в
+  `%APPDATA%\twitch_mini_player\models\mt` и `onnxruntime.dll` в `tools\onnx`
+  с проверкой SHA-256.
+- **Установщик** (`installer\twitch_mini_player.iss`, Inno Setup 6): ставится без
+  прав администратора в `%LOCALAPPDATA%\Programs\Mini Twitch Player`, сразу с
+  `libmpv`, `streamlink`, распознаванием и переводом. CI собирает `setup.exe` и
+  портативный zip и прикрепляет к релизу оба файла.
+- `scripts\fetch-vendor.ps1` — собирает внешние бинарники для установщика в
+  `vendor\` (libmpv, streamlink, whisper.cpp, модели) с проверкой SHA-256; если
+  GitHub недоступен, `streamlink` берётся из системной установки.
+- `docs\` — подробности вынесены из README: `rendering.md` (GPU-рендер, нагрузка,
+  статистика), `network.md` (буфер, «Авто»-качество, пинг), `subtitles.md`
+  (захват, распознавание, перевод, ограничения).
 
 ### Изменено
+- README сокращён до «что это, установка, возможности, управление, данные,
+  сборка»: длинные технические разделы переехали в `docs\`.
+- `streamlink` ищется сначала рядом с плеером (`streamlink\streamlink.exe`,
+  `streamlink\bin\streamlink.exe`), затем по системе — portable-версия и
+  установщик работают без отдельной установки streamlink.
+- Модель перевода ищется не только в `%APPDATA%`, но и в `models\mt` рядом с
+  `.exe`: портативная сборка не пишет в профиль пользователя.
+- `scripts\*.ps1` качают крупные файлы через `curl.exe` (запасной путь —
+  `WebClient`): PowerShell 5 с `Invoke-WebRequest` тратил на 84 МБ десятки минут,
+  а `WebClient` на больших файлах с GitHub мог замереть.
+- Индикатор уровня звука в консоли: шкала в дБ (−60…0) вместо линейной
+  `RMS·6`, с быстрым подъёмом и плавным спадом. Раньше полоса стояла почти
+  на нуле при обычной речи и оживала только у самых громких пиков.
 - Метаданные пакета для публикации: `description`, `license = "MIT"`,
   `repository`, `readme`, `publish = false`.
-- Репозиторий опубликован: <https://github.com/danil200215/twitch-mini-player>.
+- Репозиторий опубликован: <https://github.com/bedolagainc/twitch-mini-player>.
 
 ## [0.18.0] — 2026-11-24
 

@@ -1,5 +1,7 @@
 #![windows_subsystem = "windows"]
 
+mod asr;
+mod mt;
 mod gpu;
 mod libmpv;
 mod subs;
@@ -10,7 +12,7 @@ use libmpv::MpvPlayer;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use std::os::windows::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
@@ -594,6 +596,17 @@ struct TwitchMiniPlayer {
     stats_at: Option<Instant>,
     /// Субтитры: захват звука процесса (0.18.0 — уровень и тестовый WAV).
     subs: subs::Subs,
+    /// Сглаженный уровень звука для индикатора (0…1 по шкале дБ).
+    subs_level_show: f32,
+    /// Последний распознанный текст и ошибка распознавания.
+    asr_text: Option<String>,
+    asr_error: Option<String>,
+    /// Идёт распознавание: канал, из которого придёт текст.
+    asr_rx: Option<Receiver<Result<String, String>>>,
+    /// Перевод распознанного текста и его состояние.
+    mt_text: Option<String>,
+    mt_error: Option<String>,
+    mt_rx: Option<Receiver<Result<String, String>>>,
 }
 
 impl Default for TwitchMiniPlayer {
@@ -680,6 +693,13 @@ impl Default for TwitchMiniPlayer {
             ui_fps: 0.0,
             stats_text: String::new(),
             stats_at: None,
+            subs_level_show: 0.0,
+            asr_text: None,
+            asr_error: None,
+            asr_rx: None,
+            mt_text: None,
+            mt_error: None,
+            mt_rx: None,
             subs: subs::Subs::new(s.subs_capture),
         }
     }
@@ -1329,6 +1349,8 @@ impl eframe::App for TwitchMiniPlayer {
 
         // Субтитры: захват звука процесса стартует/останавливается по настройке.
         self.subs.tick();
+        self.poll_asr();
+        self.poll_mt();
         if self.subs.enabled {
             // Индикатор уровня живой даже без кадров видео (audio-only поток).
             ctx.request_repaint_after(Duration::from_millis(120));
@@ -2141,17 +2163,29 @@ impl TwitchMiniPlayer {
                 }
                 ui.horizontal(|ui| {
                     ui.label("Уровень:");
-                    // RMS речи обычно 0.02–0.2 — растягиваем на всю полосу.
-                    let level = (self.subs.level() * 6.0).clamp(0.0, 1.0);
+                    // RMS речи 0.02–0.2 — это -34…-14 дБ. Линейная шкала (RMS·6)
+                    // выглядела «мёртвой» внизу и упиралась в 100 % на громком
+                    // звуке, поэтому показываем дБ: -60 дБ = пусто, 0 дБ = максимум.
+                    let rms = self.subs.level().max(1e-5);
+                    let db = 20.0 * rms.log10();
+                    let target = ((db + 60.0) / 60.0).clamp(0.0, 1.0);
+                    if self.subs.is_running() {
+                        // Быстрый подъём и плавный спад: полоса «дышит» с речью.
+                        let k = if target > self.subs_level_show { 0.55 } else { 0.10 };
+                        self.subs_level_show += (target - self.subs_level_show) * k;
+                    } else {
+                        self.subs_level_show = 0.0;
+                    }
                     let state = if self.subs.is_running() {
                         "захват идёт"
                     } else {
                         "нет данных"
                     };
+                    let db_shown = -60.0 + 60.0 * self.subs_level_show;
                     ui.add(
-                        egui::ProgressBar::new(level)
+                        egui::ProgressBar::new(self.subs_level_show)
                             .desired_width(180.0)
-                            .text(state),
+                            .text(format!("{db_shown:.0} дБ · {state}")),
                     );
                 });
                 ui.label(
@@ -2182,6 +2216,53 @@ impl TwitchMiniPlayer {
                         );
                     }
                 });
+                ui.horizontal(|ui| {
+                    let busy = self.asr_rx.is_some();
+                    let label = if busy { "Распознаю…" } else { "Распознать 10 с" };
+                    if ui
+                        .add_enabled(!busy && self.subs.is_running(), egui::Button::new(label))
+                        .on_hover_text(
+                            "whisper.cpp (CPU) распознаёт последние 10 секунд.\n\
+                             Модель: %APPDATA%\\twitch_mini_player\\models",
+                        )
+                        .clicked()
+                    {
+                        self.start_transcribe(10.0);
+                    }
+                    if busy {
+                        ui.spinner();
+                    }
+                });
+                if let Some(text) = &self.asr_text {
+                    ui.label(egui::RichText::new(text).strong());
+                    ui.horizontal(|ui| {
+                        let busy = self.mt_rx.is_some();
+                        let label = if busy { "Перевожу…" } else { "Перевести" };
+                        if ui
+                            .add_enabled(!busy, egui::Button::new(label))
+                            .on_hover_text("opus-mt-en-ru (ONNX, локально, без интернета)")
+                            .clicked()
+                        {
+                            self.start_translate();
+                        }
+                        if busy {
+                            ui.spinner();
+                        }
+                    });
+                }
+                if let Some(ru) = &self.mt_text {
+                    ui.label(
+                        egui::RichText::new(ru)
+                            .strong()
+                            .color(egui::Color32::from_rgb(150, 220, 255)),
+                    );
+                }
+                if let Some(err) = &self.asr_error {
+                    ui.colored_label(egui::Color32::from_rgb(255, 120, 120), err);
+                }
+                if let Some(err) = &self.mt_error {
+                    ui.colored_label(egui::Color32::from_rgb(255, 120, 120), err);
+                }
                 if let Some(err) = &self.subs.last_error {
                     ui.colored_label(egui::Color32::from_rgb(255, 120, 120), err);
                 }
@@ -2259,6 +2340,90 @@ impl TwitchMiniPlayer {
             });
         if !open {
             self.dev_panel = false;
+        }
+    }
+
+    /// Запускает распознавание последних `secs` секунд в фоне.
+    fn start_transcribe(&mut self, secs: f32) {
+        let samples = self.subs.last_samples(secs);
+        if samples.len() < asr::SAMPLE_RATE as usize {
+            self.asr_error =
+                Some("мало данных: включите захват и подождите пару секунд".to_string());
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let res = match asr::Asr::new() {
+                Ok(engine) => engine.text(&samples),
+                Err(e) => Err(e),
+            };
+            let _ = tx.send(res);
+        });
+        self.asr_text = None;
+        self.asr_error = None;
+        self.asr_rx = Some(rx);
+    }
+
+    /// Забирает готовый результат распознавания (если он уже пришёл).
+    fn poll_asr(&mut self) {
+        let Some(rx) = &self.asr_rx else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Ok(text)) => {
+                self.asr_text = Some(text);
+                self.asr_rx = None;
+            }
+            Ok(Err(e)) => {
+                self.asr_error = Some(e);
+                self.asr_rx = None;
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.asr_error = Some("поток распознавания завершился".to_string());
+                self.asr_rx = None;
+            }
+        }
+    }
+
+    /// Переводит распознанный текст в фоне (модель грузится в том же потоке).
+    fn start_translate(&mut self) {
+        let Some(text) = self.asr_text.clone() else {
+            self.mt_error = Some("сначала распознайте запись".to_string());
+            return;
+        };
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let res = match mt::Translator::new() {
+                Ok(mut tr) => tr.translate(&text),
+                Err(e) => Err(e),
+            };
+            let _ = tx.send(res);
+        });
+        self.mt_text = None;
+        self.mt_error = None;
+        self.mt_rx = Some(rx);
+    }
+
+    /// Забирает готовый перевод (если он уже пришёл).
+    fn poll_mt(&mut self) {
+        let Some(rx) = &self.mt_rx else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Ok(text)) => {
+                self.mt_text = Some(text);
+                self.mt_rx = None;
+            }
+            Ok(Err(e)) => {
+                self.mt_error = Some(e);
+                self.mt_rx = None;
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.mt_error = Some("поток перевода завершился".to_string());
+                self.mt_rx = None;
+            }
         }
     }
 
@@ -2948,6 +3113,23 @@ mod tests {
             RENDER_PROFILES.len() - 1
         );
     }
+
+    #[test]
+    fn streamlink_next_to_exe_is_found_first() {
+        // Portable-версия и установщик кладут streamlink рядом с плеером.
+        let dir = std::env::temp_dir().join("tmp-sl-beside-exe");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("streamlink")).expect("каталог");
+        std::fs::write(dir.join("streamlink").join("streamlink.exe"), b"").expect("файл");
+        let found = beside_exe_streamlink_in(&dir).expect("streamlink рядом с .exe");
+        assert_eq!(found, dir.join("streamlink").join("streamlink.exe"));
+
+        // Пустая папка — ничего не находим, дальше работает поиск по системе.
+        let empty = std::env::temp_dir().join("tmp-sl-empty");
+        let _ = std::fs::remove_dir_all(&empty);
+        std::fs::create_dir_all(&empty).expect("каталог");
+        assert!(beside_exe_streamlink_in(&empty).is_none());
+    }
 }
 
 /// Возвращает имя доступного качества (ключа) из JSON streamlink:
@@ -2969,8 +3151,28 @@ fn pick_stream_key(json_text: &str, preferred: &str) -> Option<String> {
     streams.keys().next().cloned()
 }
 
+/// `streamlink.exe` рядом с плеером: `streamlink\streamlink.exe`,
+/// `streamlink\bin\streamlink.exe` или прямо в папке с `.exe`.
+/// Так работают portable-версия и установщик — отдельная установка не нужна.
+fn beside_exe_streamlink() -> Option<String> {
+    let exe = std::env::current_exe().ok()?;
+    beside_exe_streamlink_in(exe.parent()?).map(|p| p.to_string_lossy().to_string())
+}
+
+/// Варианты расположения streamlink в папке с плеером (проверяются по порядку).
+fn beside_exe_streamlink_in(dir: &Path) -> Option<PathBuf> {
+    ["streamlink\\streamlink.exe", "streamlink\\bin\\streamlink.exe", "streamlink.exe"]
+        .iter()
+        .map(|rel| dir.join(rel))
+        .find(|p| p.exists())
+}
+
 /// Ищет streamlink.exe в типичных местах установки Windows.
 fn find_streamlink() -> String {
+    // Portable-версия и установщик кладут streamlink рядом с плеером.
+    if let Some(p) = beside_exe_streamlink() {
+        return p;
+    }
     let local = std::env::var("LOCALAPPDATA").unwrap_or_default();
     let pf = std::env::var("PROGRAMFILES").unwrap_or_else(|_| "C:\\Program Files".to_string());
     let pf86 =

@@ -33,6 +33,23 @@ if (-not $ModelsDir) { $ModelsDir = Join-Path $env:APPDATA 'twitch_mini_player\m
 $ErrorActionPreference = 'Stop'
 $ProgressPreference    = 'SilentlyContinue'  # без него Invoke-WebRequest медленный
 
+# PS 5.1: Invoke-WebRequest качает крупные файлы в разы медленнее WebClient.
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+function Get-Remote {
+    param([string]$Url, [string]$Path)
+    # curl.exe есть в Windows 10+ и на раннерах CI: качает быстро и стабильно.
+    $curl = (Get-Command curl.exe -ErrorAction SilentlyContinue).Source
+    if ($curl) {
+        & $curl -L --retry 3 --retry-delay 2 --max-time 1800 -o $Path $Url
+        if ($LASTEXITCODE -ne 0) { throw "не удалось скачать $Url (curl: $LASTEXITCODE)" }
+        return
+    }
+    $wc = New-Object System.Net.WebClient
+    $wc.Headers.Add('User-Agent', 'twitch-mini-player')
+    try { $wc.DownloadFile($Url, $Path) } finally { $wc.Dispose() }
+}
+
 # --- Движок: официальная сборка whisper.cpp (CPU x64, AVX2) ------------------
 # В релизах-тегах (v1.9.x) ассетов нет, бинарники публикуются в сборках b*.
 $EngineUrl = 'https://github.com/ggml-org/whisper.cpp/releases/download/b5907/whisper-bin-x64.zip'
@@ -75,7 +92,7 @@ function Save-Checked {
         if ([string]::IsNullOrWhiteSpace($src)) { continue }
         try {
             Write-Host ("  ...  {0}" -f (Split-Path $Path -Leaf))
-            Invoke-WebRequest -Uri $src -OutFile $part -UseBasicParsing -TimeoutSec 600
+            Get-Remote -Url $src -Path $part
             break
         } catch {
             Write-Warning ("источник недоступен: {0}" -f $src)

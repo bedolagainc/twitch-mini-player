@@ -549,6 +549,16 @@ impl Ring {
     fn drain_all(&mut self) -> Vec<f32> {
         self.data.drain(..).collect()
     }
+
+    /// Последние `n` сэмплов, не вытесняя их (для распознавания).
+    fn tail(&self, n: usize) -> Vec<f32> {
+        let n = n.min(self.data.len());
+        self.data
+            .iter()
+            .skip(self.data.len() - n)
+            .copied()
+            .collect()
+    }
 }
 
 /// Состояние, общее для UI и потока захвата.
@@ -658,6 +668,14 @@ impl Capture {
         match self.shared.ring.lock() {
             Ok(mut r) => r.drain_all(),
             Err(e) => e.into_inner().drain_all(),
+        }
+    }
+
+    /// Последние `n` сэмплов 16 кГц, не забирая их из кольца.
+    pub fn last(&self, n: usize) -> Vec<f32> {
+        match self.shared.ring.lock() {
+            Ok(r) => r.tail(n),
+            Err(e) => e.into_inner().tail(n),
         }
     }
 
@@ -986,6 +1004,15 @@ impl Subs {
     /// Уровень звука (RMS) для индикатора.
     pub fn level(&self) -> f32 {
         self.capture.as_ref().map(|c| c.level()).unwrap_or(0.0)
+    }
+
+    /// Последние `secs` секунд захваченного звука (16 кГц моно).
+    pub fn last_samples(&self, secs: f32) -> Vec<f32> {
+        let n = (secs.max(0.0) * SAMPLE_RATE as f32) as usize;
+        self.capture
+            .as_ref()
+            .map(|c| c.last(n))
+            .unwrap_or_default()
     }
 
     pub fn is_running(&self) -> bool {

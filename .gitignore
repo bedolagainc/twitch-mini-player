@@ -6,6 +6,8 @@
 # scripts/fetch-whisper.ps1 и приложение (по требованию).
 /tools
 /models
+# Полный комплект для установщика (scripts/fetch-vendor.ps1)
+/vendor
 
 # Локальные отладочные артефакты
 *.log
