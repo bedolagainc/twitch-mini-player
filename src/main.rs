@@ -235,7 +235,9 @@ const AUTO_PROFILE_SLOW_MS: f32 = 14.0;
 /// умолчанию, а пользовательские (канал, громкость, окно) остаются как были.
 /// 3 — добавлен захват звука процесса для субтитров (`subs_capture`).
 /// 4 — живые субтитры: `subs_live`, `subs_translate`, `subs_font`.
-const SETTINGS_VERSION: u32 = 5;
+/// 6 — перевод промежуточных строк: `subs_partial_translate` (по умолчанию
+///     выключен, иначе распознавание с переводом занимают все ядра).
+const SETTINGS_VERSION: u32 = 6;
 
 /// Задержка от эфира, которую плеер считает комфортной (с).
 const LATENCY_TARGET_SECS: f64 = 4.0;
@@ -438,6 +440,11 @@ struct Settings {
     subs_live: bool,
     /// Переводить распознанное на русский (MarianMT, локально).
     subs_translate: bool,
+    /// Переводить и промежуточные (ещё не законченные) строки.
+    ///
+    /// Дорого: перевод фразы стоит больше, чем весь проход распознавания,
+    /// а промежуточная строка обновляется несколько раз в секунду.
+    subs_partial_translate: bool,
     /// Размер шрифта субтитров.
     subs_font: f32,
     /// Подгонять высоту окна под содержимое: под видео не остаётся пустого
@@ -470,6 +477,9 @@ impl Default for Settings {
             subs_live: false,
             // Переводчик включён: пользователь ждёт субтитры на русском.
             subs_translate: true,
+            // Промежуточные строки — на языке стримера: их перевод грузит все
+            // ядра (см. `mt_threads`), а финальная строка всё равно переведётся.
+            subs_partial_translate: false,
             subs_font: 24.0,
             // Окно подгоняется под видео: снизу не остаётся пустого места.
             fit_window: true,
@@ -626,6 +636,8 @@ struct TwitchMiniPlayer {
     subs_live: bool,
     /// Переводить фразы на русский.
     subs_translate: bool,
+    /// Переводить и промежуточные строки (дорого по процессору).
+    subs_partial_translate: bool,
     /// Размер шрифта субтитров на экране.
     subs_font: f32,
     /// Подгонять высоту окна под содержимое (без пустого места под видео).
@@ -735,6 +747,7 @@ impl Default for TwitchMiniPlayer {
             live: None,
             subs_live: s.subs_live,
             subs_translate: s.subs_translate,
+            subs_partial_translate: s.subs_partial_translate,
             subs_font: if s.subs_font > 0.0 { s.subs_font } else { 24.0 },
             fit_window: s.fit_window,
             fit_at: None,
@@ -1638,6 +1651,7 @@ impl TwitchMiniPlayer {
             subs_capture: self.subs.enabled,
             subs_live: self.subs_live,
             subs_translate: self.subs_translate,
+            subs_partial_translate: self.subs_partial_translate,
             subs_font: self.subs_font,
             fit_window: self.fit_window,
             dev_detached: self.dev_detached,
@@ -2361,6 +2375,23 @@ impl TwitchMiniPlayer {
                 self.settings_dirty = true;
             }
         });
+        ui.horizontal(|ui| {
+            let mut ptr = self.subs_partial_translate;
+            if ui
+                .checkbox(&mut ptr, "Переводить и промежуточные строки")
+                .on_hover_text(
+                    "Пока фраза не закончилась, текст обновляется несколько раз в\n\
+                     секунду, и каждый перевод занимает все ядра — Диспетчер\n\
+                     показывает 90 % процессора. Без галочки промежуточный текст\n\
+                     идёт на языке стримера, а перевод появляется с финальной\n\
+                     строкой (на 1–2 с позже).",
+                )
+                .changed()
+            {
+                self.subs_partial_translate = ptr;
+                self.settings_dirty = true;
+            }
+        });
         match &self.live {
             Some(l) => {
                 let color = if l.error.is_some() {
@@ -2678,11 +2709,16 @@ impl TwitchMiniPlayer {
         };
         if self.live.is_none() {
             crate::debug_log("live: запускаю поток субтитров");
-            self.live = Some(live::Live::start(shared, self.subs_translate));
+            self.live = Some(live::Live::start(
+                shared,
+                self.subs_translate,
+                self.subs_partial_translate,
+            ));
             self.subs.set_live(true);
         }
         if let Some(l) = &self.live {
             l.set_translate(self.subs_translate);
+            l.set_partial_translate(self.subs_partial_translate);
         }
         let mut changed = false;
         if let Some(l) = &mut self.live {

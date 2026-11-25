@@ -1,7 +1,7 @@
 ; Установщик Mini Twitch Player (Inno Setup 6).
 ;
 ; Собирается после scripts\fetch-vendor.ps1 и cargo build --release:
-;   ISCC.exe /DMyAppVersion=0.19.0 installer\twitch_mini_player.iss
+;   ISCC.exe /DMyAppVersion=0.19.1 installer\twitch_mini_player.iss
 ;
 ; Per-user установка: без прав администратора, в %LOCALAPPDATA%\Programs.
 ; Модели распознавания и перевода ставятся в %APPDATA%\twitch_mini_player\models,
@@ -13,7 +13,7 @@
 #define MyAppUrl "https://github.com/bedolagainc/twitch-mini-player"
 
 #ifndef MyAppVersion
-  #define MyAppVersion "0.19.0"
+  #define MyAppVersion "0.19.1"
 #endif
 
 [Setup]

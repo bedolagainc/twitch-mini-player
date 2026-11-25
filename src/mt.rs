@@ -206,8 +206,30 @@ pub struct Translator {
     decoder: Session,
     cfg: GenConfig,
     dir: PathBuf,
+    /// Переводы готовых фраз: в стриме повторяются целые куски («yeah»,
+    /// «let's go»), а декодирование одной фразы стоит больше, чем целый
+    /// проход распознавания.
+    cache: std::collections::HashMap<String, String>,
+    cache_order: std::collections::VecDeque<String>,
     /// Среда ONNX Runtime: держим, пока живы сессии.
     _env: ort::environment::Environment,
+}
+
+/// Сколько переводов держим в памяти. Фразы короткие, десятки килобайт.
+const CACHE_LIMIT: usize = 64;
+
+/// Сколько потоков отдаём ONNX Runtime.
+///
+/// Декодер MarianMT гоняется по шагу на слово и по умолчанию занимает **все**
+/// ядра — на i5-12400F это 1.7 с процессорного времени на одну фразу, больше,
+/// чем распознавание речи целиком. Двух потоков хватает: перевод фразы
+/// стримера всё равно укладывается в доли секунды, а остальные ядра остаются
+/// игре, браузеру и самому видео.
+fn mt_threads() -> usize {
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    (cores / 2).clamp(1, 2)
 }
 
 impl Translator {
@@ -235,6 +257,8 @@ impl Translator {
         // Среда одна на процесс (см. `shared_env`): при повторном включении CC
         // движки грузятся заново, а окружение переиспользуется.
         let env = shared_env(&dll)?;
+        // Потоки — см. `mt_threads`: перевод не должен занимать весь процессор.
+        let threads = mt_threads();
         // `tokenizers` паникует на `precompiled_charsmap: null` (Xenova-версия),
         // поэтому json правим всегда, ещё до разбора.
         let raw = std::fs::read_to_string(dir.join(TOKENIZER_FILE))
@@ -244,9 +268,17 @@ impl Translator {
             Tokenizer::from_str(&json).map_err(|e| format!("tokenizer.json: {e}"))?;
         let encoder = Session::builder(&env)
             .map_err(|e| format!("энкодер: {e}"))?
+            .with_intra_threads(threads)
+            .map_err(|e| format!("энкодер: {e}"))?
+            .with_inter_threads(1)
+            .map_err(|e| format!("энкодер: {e}"))?
             .commit_from_file(dir.join(ENCODER_FILE))
             .map_err(|e| format!("энкодер: {e}"))?;
         let decoder = Session::builder(&env)
+            .map_err(|e| format!("декодер: {e}"))?
+            .with_intra_threads(threads)
+            .map_err(|e| format!("декодер: {e}"))?
+            .with_inter_threads(1)
             .map_err(|e| format!("декодер: {e}"))?
             .commit_from_file(dir.join(DECODER_FILE))
             .map_err(|e| format!("декодер: {e}"))?;
@@ -256,6 +288,8 @@ impl Translator {
             decoder,
             cfg: GenConfig::load(dir),
             dir: dir.to_path_buf(),
+            cache: std::collections::HashMap::new(),
+            cache_order: std::collections::VecDeque::new(),
             _env: env,
         })
     }
@@ -265,7 +299,30 @@ impl Translator {
     }
 
     /// Переводит английский текст на русский (жадно, без past-кэша).
+    ///
+    /// Результат кладём в кэш: в стриме повторяются целые фразы, и второй
+    /// перевод той же строки не должен снова занимать процессор.
     pub fn translate(&mut self, text: &str) -> Result<String, String> {
+        let key = text.trim().to_lowercase();
+        if key.is_empty() {
+            return Ok(String::new());
+        }
+        if let Some(ru) = self.cache.get(&key) {
+            return Ok(ru.clone());
+        }
+        let ru = self.translate_uncached(text)?;
+        // Ограничиваем размер: старое вытесняем (порядок вставки).
+        if self.cache.len() >= CACHE_LIMIT {
+            if let Some(old) = self.cache_order.pop_front() {
+                self.cache.remove(&old);
+            }
+        }
+        self.cache.insert(key.clone(), ru.clone());
+        self.cache_order.push_back(key);
+        Ok(ru)
+    }
+
+    fn translate_uncached(&mut self, text: &str) -> Result<String, String> {
         let enc = self
             .tokenizer
             .encode(text, true)

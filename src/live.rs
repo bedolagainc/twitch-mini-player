@@ -53,12 +53,16 @@ const HOLD: Duration = Duration::from_secs(7);
 /// Промежуточная строка: как часто распознаём речь, которая ещё не закончилась.
 /// Это главный способ убрать ощущение задержки — текст появляется через
 /// ~0.4 с после начала фразы, а не после её конца.
+///
+/// Это только нижняя граница: следующий проход запускается не раньше, чем
+/// через три длительности предыдущего (см. цикл) — на слабом процессоре
+/// распознавание иначе занимает его целиком.
 const PARTIAL_EVERY: Duration = Duration::from_millis(500);
 /// Сколько звука нужно, чтобы показать промежуточную строку.
 const PARTIAL_MIN: usize = (SAMPLE_RATE as usize * 400) / 1000;
 /// Промежуточная строка распознаётся по последним секундам фразы: длиннее —
 /// только дороже, а хвост всё равно перепишет финальное распознавание.
-const PARTIAL_MAX_SECS: f32 = 5.0;
+const PARTIAL_MAX_SECS: f32 = 4.0;
 /// Сколько висит промежуточная строка, если финальной так и не пришло
 /// (например, звук оборвался на полуслове): дальше она уже врёт. Фразу,
 /// отброшенную фильтром, гасит `DropPartial` — сразу, без ожидания.
@@ -144,6 +148,14 @@ pub struct Overlay {
 pub struct Live {
     stop: Arc<AtomicBool>,
     translate: Arc<AtomicBool>,
+    /// Переводить и промежуточные строки.
+    ///
+    /// Дорого: декодирование одной фразы MarianMT стоит больше, чем весь
+    /// проход распознавания, а промежуточная строка обновляется несколько раз
+    /// в секунду. По умолчанию промежуточный текст показывается на языке
+    /// стримера, а перевод приходит с финальной строкой — так процессор не
+    /// загружается на 90 %.
+    partial_translate: Arc<AtomicBool>,
     /// Поколение настройки перевода: по нему поток узнаёт, что пользователь
     /// включил перевод заново, и пробует загрузить модель ещё раз.
     mt_gen: Arc<std::sync::atomic::AtomicU32>,
@@ -175,13 +187,15 @@ pub struct Live {
 
 impl Live {
     /// Запускает поток: модели грузятся в нём же, UI не ждёт.
-    pub fn start(shared: Arc<Shared>, translate: bool) -> Self {
+    pub fn start(shared: Arc<Shared>, translate: bool, partial_translate: bool) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let flag = Arc::new(AtomicBool::new(translate));
+        let partial = Arc::new(AtomicBool::new(partial_translate));
         let gen = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let (tx, rx) = mpsc::channel();
         let st = Arc::clone(&stop);
         let fl = Arc::clone(&flag);
+        let pt = Arc::clone(&partial);
         let gn = Arc::clone(&gen);
         let mut error = None;
         // Копия отправителя для сообщения о панике: поток субтитров живёт
@@ -191,7 +205,7 @@ impl Live {
             .name("live-subs".to_string())
             .spawn(move || {
                 let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    run(shared, st, fl, gn, tx)
+                    run(shared, st, fl, pt, gn, tx)
                 }))
                 .is_err();
                 if crashed {
@@ -211,6 +225,7 @@ impl Live {
         Self {
             stop,
             translate: flag,
+            partial_translate: partial,
             mt_gen: gen,
             thread,
             rx,
@@ -242,6 +257,11 @@ impl Live {
         if self.translate.swap(on, Ordering::Relaxed) != on {
             self.mt_gen.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    /// Включает/выключает перевод промежуточных строк (дорогая настройка).
+    pub fn set_partial_translate(&self, on: bool) {
+        self.partial_translate.store(on, Ordering::Relaxed);
     }
 
     /// Забирает события потока. `true` — что-то изменилось, нужна перерисовка.
@@ -427,9 +447,11 @@ fn run(
     shared: Arc<Shared>,
     stop: Arc<AtomicBool>,
     translate: Arc<AtomicBool>,
+    partial_translate: Arc<AtomicBool>,
     mt_gen: Arc<std::sync::atomic::AtomicU32>,
     tx: mpsc::Sender<Event>,
 ) {
+    lower_thread_priority();
     let _ = tx.send(Event::Status("загружаю распознавание речи…".to_string()));
     let asr = match asr::Asr::new() {
         Ok(a) => a,
@@ -509,7 +531,7 @@ fn run(
     // луп, «эхо» whisper на ритмичной музыке).
     let mut last_emit: Option<(String, Instant)> = None;
     // Промежуточное распознавание: когда последний раз и что показали.
-    let mut last_partial = Instant::now();
+    let mut next_partial = Instant::now();
     let mut last_partial_text = String::new();
     while !stop.load(Ordering::SeqCst) {
         // Настройка перевода могла измениться, пока шло распознавание.
@@ -633,8 +655,8 @@ fn run(
 
         // Фраза ещё не закончилась, а текст уже нужен: распознаём накопленное,
         // чтобы строка появлялась во время речи, а не после паузы.
-        if seg.speech && last_partial.elapsed() >= PARTIAL_EVERY && !stop.load(Ordering::SeqCst) {
-            last_partial = Instant::now();
+        if seg.speech && Instant::now() >= next_partial && !stop.load(Ordering::SeqCst) {
+            let step = Instant::now();
             if let Some(p) = seg.snapshot(PARTIAL_MAX_SECS) {
                 let audio = normalize(&p.samples, p.peak);
                 if let Ok((raw, no_speech)) = asr.text_streaming_checked(&audio) {
@@ -650,7 +672,14 @@ fn run(
                         && !garbled(&en, words, psecs);
                     if usable && en != last_partial_text {
                         last_partial_text = en.clone();
-                        let ru = translate_line(&mut translator, want_ru, &en, &tx);
+                        // Переводить промежуточную строку — самая дорогая
+                        // операция всего конвейера, поэтому по умолчанию она
+                        // показывается на языке стримера (см. настройку).
+                        let ru = if partial_translate.load(Ordering::Relaxed) {
+                            translate_line(&mut translator, want_ru, &en, &tx)
+                        } else {
+                            None
+                        };
                         if crate::debug_enabled() {
                             let ru_log = ru
                                 .as_deref()
@@ -665,9 +694,49 @@ fn run(
                     }
                 }
             }
+            // Следующая попытка — не раньше, чем проход «отдышится»: если
+            // распознавание занимает 300 мс, а мы запускаем его каждые 500 мс,
+            // процессор занят постоянно. Трёхкратный запас держит нагрузку
+            // распознавания в пределах трети ядра-эквивалента.
+            let cost = step.elapsed();
+            let next = partial_delay(cost);
+            next_partial = Instant::now() + next;
+            if crate::debug_enabled() {
+                crate::debug_log(&format!(
+                    "live: промежуточная заняла {} мс, следующая через {} мс",
+                    cost.as_millis(),
+                    next.as_millis()
+                ));
+            }
         }
     }
     crate::debug_log("live: поток субтитров остановлен");
+}
+
+/// Пауза до следующего промежуточного прохода.
+///
+/// Нижняя граница — `PARTIAL_EVERY`, но на слабом процессоре сам проход
+/// занимает сотни миллисекунд, и запуск «поверх себя» держал бы ядра занятыми
+/// постоянно (в Диспетчере это те самые 90 %). Трёхкратный запас оставляет
+/// распознаванию не больше трети времени, остальное достаётся видео и игре.
+fn partial_delay(cost: Duration) -> Duration {
+    PARTIAL_EVERY.max(cost * 3)
+}
+
+/// Понижает приоритет потока субтитров.
+///
+/// Распознавание и перевод — фоновая задача: видео должно играть ровно, даже
+/// когда модель загрузила все ядра. Планировщик Windows отдаёт процессор
+/// потокам с обычным приоритетом первыми, а этот поток дорабатывает в
+/// оставшееся время. Ошибку игнорируем — это подсказка, а не требование.
+fn lower_thread_priority() {
+    #[cfg(windows)]
+    unsafe {
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL,
+        };
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    }
 }
 
 /// Готовая фраза: звук для распознавания и её громкость.
@@ -1331,7 +1400,7 @@ mod tests {
         }
         let samples = read_wav(&path).expect("WAV читается");
         let shared = crate::subs::Shared::for_test();
-        let mut live = Live::start(Arc::clone(&shared), true);
+        let mut live = Live::start(Arc::clone(&shared), true, false);
         // Звук кладём порциями, как его отдаёт захват: 100 мс звука за 100 мс
         // времени. Иначе кольцо переполняется, старый звук выбрасывается и
         // замер задержки теряет смысл.
@@ -1369,6 +1438,59 @@ mod tests {
         );
     }
 
+    /// Галочка «Переводить и промежуточные строки»: с ней промежуточный текст
+    /// приходит уже по-русски (по умолчанию — на языке стримера).
+    /// `cargo test --release partial_translate_setting -- --ignored --nocapture`
+    #[test]
+    #[ignore = "требует модели whisper и перевода"]
+    fn partial_translate_setting_works() {
+        let Some(samples) = speech_sample() else {
+            return;
+        };
+        let shared = crate::subs::Shared::for_test();
+        let mut live = Live::start(Arc::clone(&shared), true, false);
+        live.set_partial_translate(true);
+        let mut partial: Option<String> = None;
+        let mut fed = 0usize;
+        // Четырёх секунд речи хватает на первую промежуточную строку.
+        let limit = (SAMPLE_RATE as usize * 4).min(samples.len());
+        for chunk in samples[..limit].chunks(SAMPLE_RATE as usize / 10) {
+            shared.push_live(chunk);
+            fed += chunk.len();
+            live.poll();
+            if partial.is_none() {
+                if let Some(cur) = live.overlay().filter(|c| c.partial) {
+                    partial = Some(cur.text);
+                }
+            }
+            std::thread::sleep(Duration::from_millis(
+                chunk.len() as u64 * 1000 / SAMPLE_RATE as u64,
+            ));
+        }
+        // Хвост: последняя долька звука может ещё распознаваться.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < deadline && partial.is_none() {
+            live.poll();
+            if let Some(cur) = live.overlay().filter(|c| c.partial) {
+                partial = Some(cur.text);
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        println!(
+            "подано {:.1} с, промежуточная: {:?}",
+            fed as f32 / SAMPLE_RATE as f32,
+            partial
+        );
+        live.stop();
+        let Some(text) = partial else {
+            panic!("промежуточная строка не появилась");
+        };
+        assert!(
+            text.chars().any(|c| ('а'..='я').contains(&c)),
+            "промежуточная строка без перевода: {text:?}"
+        );
+    }
+
     /// Выключение и повторное включение CC: поток субтитров перезапускается,
     /// и движки (whisper + ONNX) загружаются заново. Раньше второй запуск
     /// перевода падал: `ort` разрешает одну среду на процесс, а мы её
@@ -1379,7 +1501,7 @@ mod tests {
     fn live_restarts_engines() {
         let shared = crate::subs::Shared::for_test();
         for round in 1..=2 {
-            let mut live = Live::start(Arc::clone(&shared), true);
+            let mut live = Live::start(Arc::clone(&shared), true, false);
             let deadline = Instant::now() + Duration::from_secs(60);
             while Instant::now() < deadline && !live.ready {
                 live.poll();
@@ -1401,6 +1523,130 @@ mod tests {
             // Ровно то, что делает кнопка CC: остановить поток.
             live.stop();
         }
+    }
+
+    /// Сколько процессорного времени уходит на живое распознавание и перевод.
+    ///
+    /// Меряем именно процессорное время процесса, а не «стену»: whisper и
+    /// onnxruntime работают в несколько потоков, и по времени на часах
+    /// нагрузку не оценить. 12 проходов по 4 с звука — это примерно 6 с
+    /// непрерывной речи с промежуточной строкой каждые 0.5 с.
+    /// `cargo test --release bench_cpu -- --ignored --nocapture`
+    #[test]
+    #[ignore = "требует модели whisper и перевода"]
+    fn bench_cpu_breakdown() {
+        let Some(samples) = speech_sample() else {
+            return;
+        };
+        let take = (SAMPLE_RATE as usize * 4).min(samples.len());
+        let slice = &samples[..take];
+        let peak = slice.iter().fold(0f32, |a, s| a.max(s.abs()));
+        let audio = normalize(slice, peak);
+
+        let asr = asr::Asr::new().expect("модель распознавания");
+        // Прогрев: первый проход всегда дороже (аллокации, кэш).
+        let _ = asr.text_streaming(&audio[..SAMPLE_RATE as usize / 2]);
+
+        const ROUNDS: u32 = 12;
+        let cpu0 = cpu_ms();
+        let wall0 = Instant::now();
+        for _ in 0..ROUNDS {
+            let _ = asr.text_streaming_checked(&audio).expect("распознавание");
+        }
+        let asr_wall = wall0.elapsed();
+        let asr_cpu = cpu_ms().saturating_sub(cpu0);
+        println!(
+            "whisper: {ROUNDS} проходов по 4 с · стена {} мс · CPU {} мс \
+             (на проход {} мс, на секунду звука {} мс)",
+            asr_wall.as_millis(),
+            asr_cpu,
+            asr_cpu / ROUNDS as u128,
+            asr_cpu / (ROUNDS as u128 * 4)
+        );
+
+        let mut mt = mt::Translator::new().expect("модель перевода");
+        let _ = mt.translate("hello how are you");
+        let cpu1 = cpu_ms();
+        let wall1 = Instant::now();
+        for i in 0..ROUNDS {
+            // Фразы разные: одинаковые берутся из кэша и стоят ноль.
+            let line = format!("hello how are you doing today my friend, number {i}");
+            let _ = mt.translate(&line).unwrap();
+        }
+        let mt_wall = wall1.elapsed();
+        let mt_cpu = cpu_ms().saturating_sub(cpu1);
+        println!(
+            "перевод: {ROUNDS} фраз · стена {} мс · CPU {} мс (на фразу {} мс)",
+            mt_wall.as_millis(),
+            mt_cpu,
+            mt_cpu / ROUNDS as u128
+        );
+        println!(
+            "итого на 1 с речи (распознавание {} проходов/с + 2 перевода): ≈ {} мс CPU",
+            asr_cpu / (ROUNDS as u128 * 4),
+            asr_cpu / (ROUNDS as u128 * 4) + 2 * (mt_cpu / ROUNDS as u128)
+        );
+    }
+
+    /// Процессорное время процесса в миллисекундах (ядро + пользователь).
+    fn cpu_ms() -> u128 {
+        #[cfg(windows)]
+        unsafe {
+            use windows_sys::Win32::Foundation::FILETIME;
+            use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+            let zero = FILETIME {
+                dwLowDateTime: 0,
+                dwHighDateTime: 0,
+            };
+            let (mut creation, mut exit, mut kernel, mut user) = (zero, zero, zero, zero);
+            if GetProcessTimes(
+                GetCurrentProcess(),
+                &mut creation,
+                &mut exit,
+                &mut kernel,
+                &mut user,
+            ) == 0
+            {
+                return 0;
+            }
+            // FILETIME — сотни наносекунд, делим на 10 000 и получаем мс.
+            let to_ms = |f: FILETIME| {
+                (((f.dwHighDateTime as u128) << 32) | f.dwLowDateTime as u128) / 10_000
+            };
+            to_ms(kernel) + to_ms(user)
+        }
+        #[cfg(not(windows))]
+        {
+            0
+        }
+    }
+
+    /// Английская речь из `%TEMP%\speech_en.wav` (её же использует прогон
+    /// конвейера). `None` — файла нет, тест просто пропускается.
+    fn speech_sample() -> Option<Vec<f32>> {
+        let tmp = std::env::var("TEMP").ok()?;
+        let path = std::path::PathBuf::from(tmp).join("speech_en.wav");
+        if !path.exists() {
+            println!("нет файла с речью: {}", path.display());
+            return None;
+        }
+        read_wav(&path).ok()
+    }
+
+    #[test]
+    fn partial_pause_scales_with_cost() {
+        // Быстрый проход: пауза не короче базовой.
+        assert_eq!(partial_delay(Duration::from_millis(50)), PARTIAL_EVERY);
+        assert_eq!(partial_delay(Duration::from_millis(166)), PARTIAL_EVERY);
+        // Медленный: втрое дольше самого прохода — иначе ядра заняты всегда.
+        assert_eq!(
+            partial_delay(Duration::from_millis(400)),
+            Duration::from_millis(1200)
+        );
+        assert_eq!(
+            partial_delay(Duration::from_secs(1)),
+            Duration::from_secs(3)
+        );
     }
 
     #[test]
@@ -1489,7 +1735,7 @@ mod tests {
         let wav = std::fs::read(&path).expect("WAV читается");
         let mut cap = crate::subs::Capture::start().expect("захват звука процесса");
         cap.set_live(true);
-        let mut live = Live::start(cap.shared(), true);
+        let mut live = Live::start(cap.shared(), true, false);
         std::thread::sleep(Duration::from_millis(300));
         unsafe {
             PlaySoundW(

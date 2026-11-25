@@ -209,11 +209,16 @@ unsafe fn tune_params(params: *mut c_void, streaming: bool, n_samples: usize) ->
         }
         return false;
     }
-    // 4 потока — умолчание whisper.cpp; на 8 ядрах больше даёт выигрыш ~20 %.
+    // Сколько потоков отдаём распознаванию.
+    //
+    // Было «все ядра, до 8»: на i5-12400F (6 ядер / 12 потоков) whisper занимал
+    // почти весь процессор — Диспетчер показывал 90 %, а игра и браузер
+    // спотыкались. Четырёх потоков достаточно, чтобы фраза распознавалась
+    // быстрее реального времени, а половина ядер остаётся системе.
     let cores = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4);
-    p.n_threads = cores.clamp(1, 8) as c_int;
+    p.n_threads = cores.clamp(1, 4) as c_int;
     p.print_progress = false;
     p.print_realtime = false;
     p.print_timestamps = false;
