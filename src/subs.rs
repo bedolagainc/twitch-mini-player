@@ -551,6 +551,7 @@ impl Ring {
     }
 
     /// Последние `n` сэмплов, не вытесняя их (для распознавания).
+    #[allow(dead_code)]
     fn tail(&self, n: usize) -> Vec<f32> {
         let n = n.min(self.data.len());
         self.data
@@ -562,8 +563,14 @@ impl Ring {
 }
 
 /// Состояние, общее для UI и потока захвата.
-struct Shared {
+pub(crate) struct Shared {
     ring: Mutex<Ring>,
+    /// Отдельное кольцо для живых субтитров: UI забирает звук для кнопок
+    /// разработчика, поток субтитров — для распознавания, и друг другу они
+    /// не опустошают буфер.
+    live: Mutex<Ring>,
+    /// Живые субтитры включены: только тогда звук копируется в `live`.
+    live_on: AtomicBool,
     /// Уровень последнего блока (RMS) как биты `f32`.
     level: AtomicU32,
     /// Всего сэмплов 16 кГц получено за сессию.
@@ -580,6 +587,8 @@ impl Shared {
     fn new() -> Self {
         Self {
             ring: Mutex::new(Ring::new(RING_CAP)),
+            live: Mutex::new(Ring::new(RING_CAP)),
+            live_on: AtomicBool::new(false),
             level: AtomicU32::new(0),
             total: AtomicU64::new(0),
             dropped: AtomicU64::new(0),
@@ -593,6 +602,40 @@ impl Shared {
         if let Ok(mut n) = self.note.lock() {
             *n = text;
         }
+    }
+
+    /// Последние `secs` секунд звука для живых субтитров (кольцо опустошается).
+    pub(crate) fn drain_live(&self, max_secs: f32) -> Vec<f32> {
+        let limit = (max_secs.max(0.1) * SAMPLE_RATE as f32) as usize;
+        let mut r = match self.live.lock() {
+            Ok(r) => r,
+            Err(e) => e.into_inner(),
+        };
+        let samples = r.drain_all();
+        if samples.len() <= limit {
+            return samples;
+        }
+        // Поток субтитров отстал (система была занята): старое уже не нужно,
+        // иначе задержка будет только расти.
+        let skip = samples.len() - limit;
+        r.dropped += skip as u64;
+        samples[skip..].to_vec()
+    }
+
+    /// Пустое общее состояние без WASAPI — для тестов конвейера субтитров.
+    #[cfg(test)]
+    pub(crate) fn for_test() -> Arc<Self> {
+        Arc::new(Self::new())
+    }
+
+    /// Кладёт звук прямо в буфер живых субтитров (тестам не нужен захват).
+    #[cfg(test)]
+    pub(crate) fn push_live(&self, samples: &[f32]) {
+        let mut r = match self.live.lock() {
+            Ok(r) => r,
+            Err(e) => e.into_inner(),
+        };
+        r.push(samples);
     }
 }
 
@@ -672,6 +715,7 @@ impl Capture {
     }
 
     /// Последние `n` сэмплов 16 кГц, не забирая их из кольца.
+    #[allow(dead_code)]
     pub fn last(&self, n: usize) -> Vec<f32> {
         match self.shared.ring.lock() {
             Ok(r) => r.tail(n),
@@ -686,6 +730,22 @@ impl Capture {
             None
         } else {
             Some(std::mem::take(&mut *n))
+        }
+    }
+
+    /// Общее состояние захвата: по нему поток живых субтитров забирает звук.
+    pub(crate) fn shared(&self) -> Arc<Shared> {
+        Arc::clone(&self.shared)
+    }
+
+    /// Включает/выключает копирование звука в буфер живых субтитров.
+    pub(crate) fn set_live(&self, on: bool) {
+        self.shared.live_on.store(on, Ordering::SeqCst);
+        if !on {
+            // Буфер больше не нужен: не держим в памяти 30 секунд звука.
+            if let Ok(mut r) = self.shared.live.lock() {
+                *r = Ring::new(RING_CAP);
+            }
         }
     }
 
@@ -827,6 +887,15 @@ unsafe fn run_capture(
                 };
                 shared.total.fetch_add(res.len() as u64, Ordering::Relaxed);
                 shared.dropped.store(dropped, Ordering::Relaxed);
+                // Копия для живых субтитров: своё кольцо, чтобы UI и поток
+                // распознавания не отбирали звук друг у друга.
+                if shared.live_on.load(Ordering::Relaxed) {
+                    let mut live = match shared.live.lock() {
+                        Ok(l) => l,
+                        Err(e) => e.into_inner(),
+                    };
+                    live.push(&res);
+                }
             }
             ((*vt).release_buffer)(capture, frames);
         }
@@ -891,6 +960,8 @@ pub fn wav_bytes(samples: &[f32], rate: u32) -> Vec<u8> {
 pub struct Subs {
     /// Захват включён пользователем (сохраняется в настройках).
     pub enabled: bool,
+    /// Звук копируется в буфер живых субтитров.
+    live: bool,
     capture: Option<Capture>,
     recording: Option<Vec<f32>>,
     pub last_error: Option<String>,
@@ -901,6 +972,7 @@ impl Subs {
     pub fn new(enabled: bool) -> Self {
         Self {
             enabled,
+            live: false,
             capture: None,
             recording: None,
             last_error: None,
@@ -933,9 +1005,14 @@ impl Subs {
             match Capture::start() {
                 Ok(c) => {
                     self.last_error = None;
+                    c.set_live(self.live);
                     self.capture = Some(c);
+                    crate::debug_log("subs: захват звука процесса запущен");
                 }
                 Err(e) => {
+                    // Без лога причина видна только в консоли, а болячки WASAPI
+                    // (нет Windows 11, нет устройства) ищут как раз по логу.
+                    crate::debug_log(&format!("subs: захват не запустился: {e}"));
                     self.last_error = Some(e);
                     self.enabled = false;
                 }
@@ -944,6 +1021,7 @@ impl Subs {
         }
         // Поток мог остановиться сам (сменилось устройство вывода, ошибка WASAPI).
         if let Some(note) = self.capture.as_ref().and_then(|c| c.take_note()) {
+            crate::debug_log(&format!("subs: захват остановлен: {note}"));
             self.last_error = Some(note);
             self.enabled = false;
             self.capture = None;
@@ -980,6 +1058,8 @@ impl Subs {
     }
 
     /// Начинает тестовую запись: накопленное до нажатия в файл не попадает.
+    /// В интерфейсе кнопки записи больше нет — функция осталась для проверки захвата.
+    #[allow(dead_code)]
     pub fn start_recording(&mut self) {
         if self.capture.is_none() {
             self.last_error = Some("сначала включите захват звука".to_string());
@@ -995,6 +1075,7 @@ impl Subs {
     }
 
     /// Сколько секунд уже записано (`None` — запись не идёт).
+    #[allow(dead_code)]
     pub fn recording_secs(&self) -> Option<f32> {
         self.recording
             .as_ref()
@@ -1007,6 +1088,7 @@ impl Subs {
     }
 
     /// Последние `secs` секунд захваченного звука (16 кГц моно).
+    #[allow(dead_code)]
     pub fn last_samples(&self, secs: f32) -> Vec<f32> {
         let n = (secs.max(0.0) * SAMPLE_RATE as f32) as usize;
         self.capture
@@ -1017,6 +1099,19 @@ impl Subs {
 
     pub fn is_running(&self) -> bool {
         self.capture.as_ref().map(|c| c.is_running()).unwrap_or(false)
+    }
+
+    /// Состояние захвата для потока живых субтитров (`None` — захват не идёт).
+    pub(crate) fn shared(&self) -> Option<Arc<Shared>> {
+        self.capture.as_ref().map(|c| c.shared())
+    }
+
+    /// Просит захват копировать звук в буфер живых субтитров.
+    pub(crate) fn set_live(&mut self, on: bool) {
+        self.live = on;
+        if let Some(c) = &self.capture {
+            c.set_live(on);
+        }
     }
 
     /// Строка «48.0 кГц, 2 кан → 16 кГц моно · 12.3 с · вытеснено 0».

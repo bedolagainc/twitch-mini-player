@@ -8,6 +8,8 @@
 
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 use windows_sys::Win32::System::LibraryLoader::{
     FreeLibrary, GetModuleHandleW, GetProcAddress, LoadLibraryExW, LoadLibraryW,
 };
@@ -61,6 +63,205 @@ pub const FALLBACK_MODEL: &str = "ggml-tiny.en-q5_1.bin";
 /// `whisper_sampling_strategy::WHISPER_SAMPLING_GREEDY`.
 const SAMPLING_GREEDY: c_int = 0;
 
+/// Сколько времени отводится на распознавание фразы до принудительной
+/// остановки. Шесть секунд звука — это ~1.2 с работы модели, поэтому 1.5 с
+/// плюс 0.35 с на секунду звука покрывают медленные машины с запасом.
+const DECODE_BASE_MS: u64 = 1500;
+const DECODE_PER_SEC_MS: f32 = 350.0;
+/// Жёсткий потолок декодирования: дольше — это уже зацикливание модели.
+const DECODE_CAP_MS: u64 = 6000;
+/// Предел токенов на фразу: речь не быстрее ~3 слов в секунду (≈4 токена),
+/// поэтому 8 токенов на секунду звука отсекают циклы «no no no no…».
+const TOKENS_PER_SEC: f32 = 8.0;
+/// Запас токенов на короткие фразы и знаки препинания.
+const TOKENS_SLACK: c_int = 16;
+
+/// Язык распознавания в виде C-строки: модель `.en` всё равно знает только его,
+/// но без явного `language` whisper тратит время на определение языка.
+const LANG_EN: &[u8] = b"en\0";
+
+/// Префикс `struct whisper_full_params` из `whisper.h` (b5907).
+///
+/// Объявлены поля только до `abort_callback`: смещения первых полей заданы
+/// заголовком и не меняются, а всё, что дальше (колбэки энкодера и грамматика),
+/// плеер не трогает. Так можно поправить параметры в объекте, который вернул
+/// сам `whisper.dll`, не копируя структуру целиком и не завися от её размера.
+#[repr(C)]
+struct FullParams {
+    strategy: c_int,
+    n_threads: c_int,
+    n_max_text_ctx: c_int,
+    offset_ms: c_int,
+    duration_ms: c_int,
+    translate: bool,
+    no_context: bool,
+    no_timestamps: bool,
+    single_segment: bool,
+    print_special: bool,
+    print_progress: bool,
+    print_realtime: bool,
+    print_timestamps: bool,
+    token_timestamps: bool,
+    thold_pt: f32,
+    thold_ptsum: f32,
+    max_len: c_int,
+    split_on_word: bool,
+    max_tokens: c_int,
+    debug_mode: bool,
+    audio_ctx: c_int,
+    tdrz_enable: bool,
+    suppress_regex: *const c_char,
+    initial_prompt: *const c_char,
+    carry_initial_prompt: bool,
+    prompt_tokens: *const i32,
+    prompt_n_tokens: c_int,
+    language: *const c_char,
+    detect_language: bool,
+    suppress_blank: bool,
+    suppress_nst: bool,
+    temperature: f32,
+    max_initial_ts: f32,
+    length_penalty: f32,
+    temperature_inc: f32,
+    entropy_thold: f32,
+    logprob_thold: f32,
+    no_speech_thold: f32,
+    greedy_best_of: c_int,
+    beam_size: c_int,
+    beam_patience: f32,
+    /// `abort_callback`: whisper зовёт его во время работы энкодера и декодера,
+    /// `true` — прервать вычисления (тогда `whisper_full` вернёт -6/-8/-9).
+    abort_callback: Option<unsafe extern "C" fn(*mut c_void) -> bool>,
+    abort_callback_user_data: *mut c_void,
+}
+
+/// О несовпадении раскладки сообщаем один раз, а не на каждой фразе.
+static TUNE_REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Момент (мс от первого вызова `now_ms`), после которого текущее
+/// декодирование надо прервать. Атомарные, а не thread-local: ggml проверяет
+/// `abort_callback` внутри вычислительного графа, и поток может оказаться
+/// не тем, что запустил распознавание.
+static DEADLINE_MS: AtomicU64 = AtomicU64::new(u64::MAX);
+/// Сработал ли `abort_callback` в текущем вызове `whisper_full`.
+static ABORTED: AtomicBool = AtomicBool::new(false);
+
+/// Миллисекунды от первого обращения — монотонная шкала для дедлайна.
+fn now_ms() -> u64 {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    START
+        .get_or_init(Instant::now)
+        .elapsed()
+        .as_millis()
+        .min(u64::MAX as u128) as u64
+}
+
+/// `abort_callback` whisper: останавливает энкодер и декодер по времени.
+///
+/// Без него зацикливание модели на шуме («no no no no …») длится десятки
+/// секунд: жадное декодирование ограничено только `n_max_text_ctx` (16 тыс.
+/// токенов), а живой поток в это время стоит и субтитры пропадают.
+unsafe extern "C" fn abort_when_due(_: *mut c_void) -> bool {
+    if now_ms() < DEADLINE_MS.load(Ordering::Relaxed) {
+        return false;
+    }
+    ABORTED.store(true, Ordering::Relaxed);
+    true
+}
+
+/// Немедленно прерывает текущее распознавание.
+///
+/// Нужен при выключении CC: `Live::stop` дожидается потока, а живой проход
+/// whisper иначе может идти до `DECODE_CAP_MS` и окно «зависает».
+pub fn abort_now() {
+    DEADLINE_MS.store(now_ms(), Ordering::Relaxed);
+}
+
+/// Сколько времени отводим на декодирование фразы такой длины.
+fn decode_limit(secs: f32) -> Duration {
+    let ms = DECODE_BASE_MS + (secs.max(0.0) * DECODE_PER_SEC_MS) as u64;
+    Duration::from_millis(ms.min(DECODE_CAP_MS))
+}
+
+/// Настраивает параметры распознавания.
+///
+/// `streaming` — живой режим: каждая фраза распознаётся независимо (без
+/// контекста предыдущей), одним сегментом и без таймкодов. Это дешевле и не
+/// даёт модели «продолжать» прошлую фразу на тишине. `n_samples` — длина
+/// буфера: по ней уменьшается аудио-контекст, иначе whisper кодирует полные
+/// 30 секунд даже для двухсекундной фразы (почти секунда процессора впустую).
+///
+/// Возвращает `false`, если структура не похожа на `whisper_full_params`
+/// (тогда работаем на умолчаниях DLL: лучше медленнее, чем с битой памятью).
+unsafe fn tune_params(params: *mut c_void, streaming: bool, n_samples: usize) -> bool {
+    if params.is_null() {
+        return false;
+    }
+    let p = &mut *(params as *mut FullParams);
+    // `strategy` и `n_threads` — первые два поля. Если там не то, что ждём,
+    // DLL собрана из другой версии whisper.cpp: дальше писать нельзя.
+    if p.strategy != SAMPLING_GREEDY || p.n_threads < 1 || p.n_threads > 512 {
+        if !TUNE_REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            crate::debug_log(&format!(
+                "asr: неожидаемые параметры whisper (strategy={}, threads={}), работаю на умолчаниях",
+                p.strategy, p.n_threads
+            ));
+        }
+        return false;
+    }
+    // 4 потока — умолчание whisper.cpp; на 8 ядрах больше даёт выигрыш ~20 %.
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    p.n_threads = cores.clamp(1, 8) as c_int;
+    p.print_progress = false;
+    p.print_realtime = false;
+    p.print_timestamps = false;
+    p.print_special = false;
+    if streaming {
+        p.no_context = true;
+        p.no_timestamps = true;
+        p.single_segment = true;
+        p.language = LANG_EN.as_ptr() as *const c_char;
+        p.detect_language = false;
+        p.translate = false;
+        p.suppress_blank = true;
+        p.suppress_nst = true;
+        // Чуть строже умолчания (0.6): в стриме много музыки и звуков игры,
+        // и на них модель охотнее выдаёт «тишину» вместо выдуманного текста.
+        p.no_speech_thold = 0.5;
+        // Без fallback-проходов по температуре: они нужны для «красивого»
+        // текста, а в живом режиме важна предсказуемая задержка.
+        p.temperature = 0.0;
+        p.temperature_inc = 0.0;
+        // Жадное декодирование оставляем как есть: `greedy.best_of = 1`
+        // проверялся и дал повторы («I am testing the I am testing the …»)
+        // на живом звуке — качество важнее десятков миллисекунд.
+        // Энкодер получает только реальную длину фразы (+запас), а не 30 с:
+        // 30 с = 1500 позиций, 3 с ≈ 150. Это главный выигрыш по времени.
+        //
+        // Запас 50 % и минимум 256 позиций — не «на всякий случай»: меньший
+        // аудио-контекст (проверял 128–160) заставляет модель зацикливаться
+        // («I am testing the I am testing the …») и терять конец фразы.
+        // 256 позиций = 5.1 с звука: короткие фразы упираются в этот минимум,
+        // поэтому дальше сокращать нечего — быстрее делает только нарезка
+        // фраз короче (см. `SILENCE_CLOSE` в live.rs) и промежуточные строки.
+        let secs = n_samples as f32 / SAMPLE_RATE as f32;
+        let frames = (secs / 0.02).ceil() as c_int;
+        let ctx = (frames + frames / 2 + 32).max(256);
+        // Энкодер свёрточный с шагом 2: нечётная длина недопустима.
+        p.audio_ctx = (((ctx + 1) / 2) * 2).min(1500);
+        // Пределы на случай зацикливания. Жадное декодирование без них
+        // ограничено только `n_max_text_ctx`: на двухсекундном шуме модель
+        // выдавала тысячи токенов «no no no …» и работала 38 секунд, а
+        // живой поток всё это время стоял.
+        p.max_tokens = ((secs * TOKENS_PER_SEC) as c_int + TOKENS_SLACK).max(24);
+        p.abort_callback = Some(abort_when_due);
+        p.abort_callback_user_data = std::ptr::null_mut();
+    }
+    true
+}
+
 type FnInitFromFile = unsafe extern "C" fn(*const c_char) -> *mut c_void;
 type FnFreeCtx = unsafe extern "C" fn(*mut c_void);
 type FnDefaultParams = unsafe extern "C" fn(c_int) -> *mut c_void;
@@ -70,6 +271,8 @@ type FnText = unsafe extern "C" fn(*mut c_void, c_int) -> *const c_char;
 type FnTime = unsafe extern "C" fn(*mut c_void, c_int) -> i64;
 type FnInitWithParams = unsafe extern "C" fn(*const c_char, CtxParams) -> *mut c_void;
 type FnDefaultCtxParams = unsafe extern "C" fn() -> CtxParams;
+/// `whisper_full_get_segment_no_speech_prob`: вероятность «это не речь».
+type FnSegmentNoSpeech = unsafe extern "C" fn(*mut c_void, c_int) -> f32;
 
 /// Указатели на функции `whisper.dll`.
 struct Api {
@@ -83,6 +286,9 @@ struct Api {
     segment_text: FnText,
     segment_t0: FnTime,
     segment_t1: FnTime,
+    /// Не во всех сборках whisper.cpp: если символа нет, фильтр речи просто
+    /// не работает (живые субтитры продолжают идти).
+    segment_no_speech: Option<FnSegmentNoSpeech>,
     free_params: Option<unsafe extern "C" fn(*mut c_void)>,
 }
 
@@ -225,6 +431,7 @@ unsafe fn load_api(module: isize) -> Result<Api, String> {
     let p_text = sym!("whisper_full_get_segment_text");
     let p_t0 = sym!("whisper_full_get_segment_t0");
     let p_t1 = sym!("whisper_full_get_segment_t1");
+    let p_no_speech = get_sym(module, "whisper_full_get_segment_no_speech_prob");
     let p_free_params = get_sym(module, "whisper_free_params");
 
     if !missing.is_empty() {
@@ -253,6 +460,11 @@ unsafe fn load_api(module: isize) -> Result<Api, String> {
         segment_text: std::mem::transmute(p_text),
         segment_t0: std::mem::transmute(p_t0),
         segment_t1: std::mem::transmute(p_t1),
+        segment_no_speech: if p_no_speech.is_null() {
+            None
+        } else {
+            Some(std::mem::transmute(p_no_speech))
+        },
         free_params: if p_free_params.is_null() {
             None
         } else {
@@ -290,18 +502,26 @@ pub fn find_model() -> Option<PathBuf> {
 }
 
 /// Один распознанный фрагмент: таймкоды в сотых долях секунды (как у whisper).
+/// Таймкоды и `no_speech` нужны диагностике и тестам; живой оверлей берёт текст.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct Segment {
     pub t0_cs: i64,
     pub t1_cs: i64,
     pub text: String,
+    /// `no_speech_prob` сегмента: насколько модель считает, что это не речь
+    /// (музыка, звуки игры, шум). В живом режиме по нему отсеиваются
+    /// «субтитры» из игрового звука.
+    pub no_speech: f32,
 }
 
 impl Segment {
+    #[allow(dead_code)]
     pub fn start_secs(&self) -> f32 {
         self.t0_cs as f32 / 100.0
     }
 
+    #[allow(dead_code)]
     pub fn end_secs(&self) -> f32 {
         self.t1_cs as f32 / 100.0
     }
@@ -379,7 +599,18 @@ impl Asr {
     }
 
     /// Распознаёт буфер 16 кГц моно. Пустой ответ = тишина или не речь.
+    #[allow(dead_code)]
     pub fn transcribe(&self, samples: &[f32]) -> Result<Vec<Segment>, String> {
+        self.transcribe_opts(samples, false)
+    }
+
+    /// Распознаёт фразу в живом режиме: без контекста, одним сегментом,
+    /// без таймкодов. Так дешевле и нет склейки с предыдущей фразой.
+    pub fn transcribe_streaming(&self, samples: &[f32]) -> Result<Vec<Segment>, String> {
+        self.transcribe_opts(samples, true)
+    }
+
+    fn transcribe_opts(&self, samples: &[f32], streaming: bool) -> Result<Vec<Segment>, String> {
         if samples.is_empty() {
             return Ok(Vec::new());
         }
@@ -389,9 +620,37 @@ impl Asr {
         if params.is_null() {
             return Err("whisper_full_default_params_by_ref вернул null".to_string());
         }
+        // Параметры правим до вызова: после `whisper_full` структуру забирает
+        // `whisper_free_params`.
+        unsafe {
+            tune_params(params, streaming, samples.len());
+        }
+        // Срок действует только в живом режиме: `abort_callback` ставится там
+        // же, в `tune_params`.
+        let limit = streaming.then(|| decode_limit(samples.len() as f32 / SAMPLE_RATE as f32));
+        if let Some(limit) = limit {
+            ABORTED.store(false, Ordering::Relaxed);
+            DEADLINE_MS.store(
+                now_ms().saturating_add(limit.as_millis() as u64),
+                Ordering::Relaxed,
+            );
+        }
         let rc = unsafe { (self.api.full)(self.ctx, params, samples.as_ptr(), n) };
+        let aborted = ABORTED.swap(false, Ordering::Relaxed);
+        DEADLINE_MS.store(u64::MAX, Ordering::Relaxed);
         if let Some(free) = self.api.free_params {
             unsafe { free(params) };
+        }
+        if aborted {
+            // Обрывок прерванного прохода не показываем: это цикл, а не речь.
+            if crate::debug_enabled() {
+                let ms = limit.map(|l| l.as_millis()).unwrap_or(0);
+                crate::debug_log(&format!(
+                    "asr: распознавание прервано по времени ({ms} мс на {:.1} с звука) — модель зациклилась",
+                    samples.len() as f32 / SAMPLE_RATE as f32
+                ));
+            }
+            return Ok(Vec::new());
         }
         if rc != 0 {
             return Err(format!("whisper_full завершился с кодом {rc}"));
@@ -414,6 +673,11 @@ impl Asr {
             out.push(Segment {
                 t0_cs: unsafe { (self.api.segment_t0)(self.ctx, i) },
                 t1_cs: unsafe { (self.api.segment_t1)(self.ctx, i) },
+                no_speech: match self.api.segment_no_speech {
+                    Some(f) => unsafe { f(self.ctx, i) }.clamp(0.0, 1.0),
+                    // Символа нет — считаем, что фильтр речи выключен.
+                    None => 0.0,
+                },
                 text,
             });
         }
@@ -421,6 +685,7 @@ impl Asr {
     }
 
     /// Текст без таймкодов — для проверки и логов.
+    #[allow(dead_code)]
     pub fn text(&self, samples: &[f32]) -> Result<String, String> {
         let segs = self.transcribe(samples)?;
         Ok(segs
@@ -428,6 +693,26 @@ impl Asr {
             .map(|s| s.text.as_str())
             .collect::<Vec<_>>()
             .join(" "))
+    }
+
+    /// Текст живой фразы (без контекста, без таймкодов).
+    pub fn text_streaming(&self, samples: &[f32]) -> Result<String, String> {
+        Ok(self.text_streaming_checked(samples)?.0)
+    }
+
+    /// Текст живой фразы и «вероятность, что это не речь» (максимум по
+    /// сегментам). По второму значению живой режим отбрасывает музыку и звуки
+    /// игры: whisper помечает их высоким `no_speech_prob`, даже если выдал
+    /// правдоподобную фразу.
+    pub fn text_streaming_checked(&self, samples: &[f32]) -> Result<(String, f32), String> {
+        let segs = self.transcribe_streaming(samples)?;
+        let no_speech = segs.iter().map(|s| s.no_speech).fold(0.0f32, f32::max);
+        let text = segs
+            .iter()
+            .map(|s| s.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        Ok((text, no_speech))
     }
 }
 

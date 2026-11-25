@@ -21,6 +21,34 @@ pub const ONNX_DLL: &str = "onnxruntime.dll";
 /// Запасное ограничение длины ответа, если нет `generation_config.json`.
 const MAX_NEW_TOKENS: usize = 96;
 
+/// Среда ONNX Runtime одна на процесс и живёт до выхода из программы.
+///
+/// `ort` разрешает создать её только один раз (`only one environment is allowed
+/// per process`), а живые субтитры перезапускаются: выключили CC — поток
+/// субтитров остановился, включили — движки загружаются заново. Если держать
+/// среду в `Translator`, второй запуск получал ошибку и перевод пропадал
+/// до перезапуска плеера. Неудачную загрузку не запоминаем: если DLL появится,
+/// следующая попытка пройдёт.
+static ONNX_ENV: std::sync::Mutex<Option<ort::environment::Environment>> =
+    std::sync::Mutex::new(None);
+
+/// Открывает окружение ONNX из `dll` (или отдаёт уже открытое).
+fn shared_env(dll: &Path) -> Result<ort::environment::Environment, String> {
+    let mut cached = match ONNX_ENV.lock() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
+    if let Some(env) = cached.as_ref() {
+        return Ok(env.clone());
+    }
+    let env = ort::init_from(dll)
+        .map_err(|e| format!("onnxruntime.dll ({}): {e}", dll.display()))?
+        .build()
+        .map_err(|e| format!("onnxruntime: {e}"))?;
+    *cached = Some(env.clone());
+    Ok(env)
+}
+
 /// Каталог модели перевода по умолчанию (профиль пользователя).
 pub fn models_dir() -> PathBuf {
     let base = std::env::var_os("APPDATA")
@@ -96,6 +124,7 @@ pub fn find_onnx_dll() -> Option<PathBuf> {
 }
 
 /// Готов ли перевод: есть рантайм и все файлы модели.
+#[allow(dead_code)]
 pub fn is_available() -> bool {
     let dir = models_dir();
     find_onnx_dll().is_some()
@@ -203,10 +232,9 @@ impl Translator {
             "перевод недоступен: onnxruntime.dll не найден рядом с .exe (папка tools\\onnx)"
                 .to_string()
         })?;
-        let env = ort::init_from(&dll)
-            .map_err(|e| format!("onnxruntime.dll ({}): {e}", dll.display()))?
-            .build()
-            .map_err(|e| format!("onnxruntime: {e}"))?;
+        // Среда одна на процесс (см. `shared_env`): при повторном включении CC
+        // движки грузятся заново, а окружение переиспользуется.
+        let env = shared_env(&dll)?;
         // `tokenizers` паникует на `precompiled_charsmap: null` (Xenova-версия),
         // поэтому json правим всегда, ещё до разбора.
         let raw = std::fs::read_to_string(dir.join(TOKENIZER_FILE))

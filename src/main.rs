@@ -4,6 +4,7 @@ mod asr;
 mod mt;
 mod gpu;
 mod libmpv;
+mod live;
 mod subs;
 mod tray;
 
@@ -233,7 +234,8 @@ const AUTO_PROFILE_SLOW_MS: f32 = 14.0;
 /// (декод, отрисовка, авто-качество) сбрасываются на лучшие значения по
 /// умолчанию, а пользовательские (канал, громкость, окно) остаются как были.
 /// 3 — добавлен захват звука процесса для субтитров (`subs_capture`).
-const SETTINGS_VERSION: u32 = 3;
+/// 4 — живые субтитры: `subs_live`, `subs_translate`, `subs_font`.
+const SETTINGS_VERSION: u32 = 5;
 
 /// Задержка от эфира, которую плеер считает комфортной (с).
 const LATENCY_TARGET_SECS: f64 = 4.0;
@@ -432,6 +434,17 @@ struct Settings {
     pinned: bool,
     /// Захват звука нашего процесса для субтитров (этап 0.18.0).
     subs_capture: bool,
+    /// Живые субтитры поверх видео: фразы появляются по мере речи стримера.
+    subs_live: bool,
+    /// Переводить распознанное на русский (MarianMT, локально).
+    subs_translate: bool,
+    /// Размер шрифта субтитров.
+    subs_font: f32,
+    /// Подгонять высоту окна под содержимое: под видео не остаётся пустого
+    /// места, окно заканчивается строкой состояния.
+    fit_window: bool,
+    /// Консоль разработчика — отдельным окном (можно утащить за пределы плеера).
+    dev_detached: bool,
     client_id: String,
     /// Последняя геометрия окна (позиция и размер), чтобы всё открывалось как было.
     window: Option<WindowRect>,
@@ -454,6 +467,13 @@ impl Default for Settings {
             pinned: false,
             // Захват звука включается осознанно: он нужен только ради субтитров.
             subs_capture: false,
+            subs_live: false,
+            // Переводчик включён: пользователь ждёт субтитры на русском.
+            subs_translate: true,
+            subs_font: 24.0,
+            // Окно подгоняется под видео: снизу не остаётся пустого места.
+            fit_window: true,
+            dev_detached: false,
             client_id: String::new(),
             window: None,
         }
@@ -574,6 +594,8 @@ struct TwitchMiniPlayer {
     updates: u64,
     /// Момент предыдущего обновления UI (диагностика).
     last_update_at: Option<Instant>,
+    /// Когда последний раз писали в лог уровень захвата (диагностика).
+    subs_log_at: Option<Instant>,
     /// Контекст egui — нужен, чтобы будить UI из колбэка mpv.
     egui_ctx: Option<egui::Context>,
     /// Иконка в трее создана.
@@ -598,15 +620,29 @@ struct TwitchMiniPlayer {
     subs: subs::Subs,
     /// Сглаженный уровень звука для индикатора (0…1 по шкале дБ).
     subs_level_show: f32,
-    /// Последний распознанный текст и ошибка распознавания.
-    asr_text: Option<String>,
-    asr_error: Option<String>,
-    /// Идёт распознавание: канал, из которого придёт текст.
-    asr_rx: Option<Receiver<Result<String, String>>>,
-    /// Перевод распознанного текста и его состояние.
-    mt_text: Option<String>,
-    mt_error: Option<String>,
-    mt_rx: Option<Receiver<Result<String, String>>>,
+    /// Живые субтитры: поток обработки (`None` — выключены).
+    live: Option<live::Live>,
+    /// Субтитры включены пользователем (кнопка «CC», клавиша C).
+    subs_live: bool,
+    /// Переводить фразы на русский.
+    subs_translate: bool,
+    /// Размер шрифта субтитров на экране.
+    subs_font: f32,
+    /// Подгонять высоту окна под содержимое (без пустого места под видео).
+    fit_window: bool,
+    /// Когда последний раз подгоняли окно (не чаще 4 раз в секунду).
+    fit_at: Option<Instant>,
+    /// Консоль разработчика показывается отдельным окном ОС.
+    dev_detached: bool,
+    /// Отладочный автозапуск канала уже выполнен (TW_AUTOPLAY=1).
+    autoplay_done: bool,
+    /// Готовая подпись громкости: строка собирается при изменении, а не в кадре.
+    volume_text: String,
+    /// Соотношение сторон кадра и время замера: свойство mpv читается не чаще
+    /// раза в 2 секунды, а не каждый кадр.
+    aspect_cache: Option<(f32, Instant)>,
+    /// Последняя подсказка иконки трея (чтобы не собирать строку каждый кадр).
+    tray_tip: String,
 }
 
 impl Default for TwitchMiniPlayer {
@@ -683,6 +719,7 @@ impl Default for TwitchMiniPlayer {
             pending_url: None,
             updates: 0,
             last_update_at: None,
+            subs_log_at: None,
             egui_ctx: None,
             tray_started: false,
             online: None,
@@ -694,13 +731,18 @@ impl Default for TwitchMiniPlayer {
             stats_text: String::new(),
             stats_at: None,
             subs_level_show: 0.0,
-            asr_text: None,
-            asr_error: None,
-            asr_rx: None,
-            mt_text: None,
-            mt_error: None,
-            mt_rx: None,
-            subs: subs::Subs::new(s.subs_capture),
+            subs: subs::Subs::new(s.subs_capture || s.subs_live),
+            live: None,
+            subs_live: s.subs_live,
+            subs_translate: s.subs_translate,
+            subs_font: if s.subs_font > 0.0 { s.subs_font } else { 24.0 },
+            fit_window: s.fit_window,
+            fit_at: None,
+            dev_detached: s.dev_detached,
+            autoplay_done: false,
+            volume_text: format!("Громкость: {}%", s.volume),
+            aspect_cache: None,
+            tray_tip: String::new(),
         }
     }
 }
@@ -713,6 +755,17 @@ impl eframe::App for TwitchMiniPlayer {
         // Контекст нужен колбэкам mpv (пробуждение UI по новому кадру).
         if self.egui_ctx.is_none() {
             self.egui_ctx = Some(ctx.clone());
+        }
+        // Горячие клавиши субтитров: работают и в полноэкранном режиме.
+        // Пока фокус в поле ввода канала, буквы не перехватываем.
+        if !ctx.wants_keyboard_input() {
+            if ctx.input(|i| i.key_pressed(egui::Key::C)) {
+                self.set_live(!self.subs_live);
+            }
+            if self.subs_live && ctx.input(|i| i.key_pressed(egui::Key::T)) {
+                self.subs_translate = !self.subs_translate;
+                self.settings_dirty = true;
+            }
         }
         // Иконка в трее: создаётся один раз, после того как окно уже есть.
         if self.tray && !self.tray_started {
@@ -751,6 +804,26 @@ impl eframe::App for TwitchMiniPlayer {
             self.video_only = true;
             self.video_only_hint = Some(Instant::now());
             set_video_fullscreen(ctx, true);
+        }
+        // Отладочный автозапуск канала из настроек: TW_AUTOPLAY=1.
+        // Нужен, чтобы проверять живые субтитры без ручных кликов.
+        if !self.autoplay_done
+            && std::env::var("TW_AUTOPLAY").map(|v| !v.is_empty()).unwrap_or(false)
+        {
+            self.autoplay_done = true;
+            self.start_play();
+        }
+        // Отладочный показ консоли: TW_DEV_PANEL=1 (и TW_DEV_DETACHED=1 —
+        // сразу отдельным окном). Нужен, чтобы проверять раскладку без кликов.
+        if !self.dev_panel && std::env::var("TW_DEV_PANEL").map(|v| !v.is_empty()).unwrap_or(false)
+        {
+            self.dev_panel = true;
+            if std::env::var("TW_DEV_DETACHED")
+                .map(|v| !v.is_empty())
+                .unwrap_or(false)
+            {
+                self.dev_detached = true;
+            }
         }
         // Одиночный клик по видео = пауза. Ждём 250 мс: если придёт второй
         // клик, сработает только полный экран, а не пауза с продолжением.
@@ -884,7 +957,14 @@ impl eframe::App for TwitchMiniPlayer {
         let panel_frame = if self.video_only {
             egui::Frame::none()
         } else {
-            egui::Frame::central_panel(&ctx.style())
+            // Нижний отступ меньше остальных: под строкой состояния не должно
+            // оставаться пустой полосы — окно заканчивается ею.
+            egui::Frame::central_panel(&ctx.style()).inner_margin(egui::Margin {
+                left: 8.0,
+                right: 8.0,
+                top: 8.0,
+                bottom: 2.0,
+            })
         };
         let panel = egui::CentralPanel::default().frame(panel_frame);
         panel.show(ctx, |ui| {
@@ -910,13 +990,21 @@ impl eframe::App for TwitchMiniPlayer {
                 } else {
                     self.quality.clone()
                 };
+                // Enter в поле канала — то же, что «Воспроизвести».
+                let mut enter_play = false;
 
                 ui.horizontal(|ui| {
                     ui.label("Канал Twitch:");
-                    if ui.text_edit_singleline(&mut self.channel).changed() {
+                    let edit = ui
+                        .text_edit_singleline(&mut self.channel)
+                        .on_hover_text("Enter — включить канал");
+                    if edit.changed() {
                         // Пользователь печатает — через мгновение прогреем поток заранее.
                         self.prefetch_at = Some(Instant::now());
                         self.online = None;
+                    }
+                    if edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        enter_play = true;
                     }
                     // Статус канала: точка видно сразу, подробности — в подсказке.
                     // Круг рисуем сами: у шрифта нет глифов «●»/«○», и вместо них
@@ -998,6 +1086,7 @@ impl eframe::App for TwitchMiniPlayer {
                             }
                         });
                     // Всё «разработческое» — в отдельном окне, чтобы не мешать.
+                    let mut toggle_live = false;
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
                             .button("Консоль")
@@ -1009,7 +1098,22 @@ impl eframe::App for TwitchMiniPlayer {
                         {
                             self.dev_panel = !self.dev_panel;
                         }
+                        // Живые субтитры: один клик — и русский текст поверх видео.
+                        if ui
+                            .selectable_label(self.subs_live, "CC")
+                            .on_hover_text(
+                                "Субтитры в реальном времени: звук стрима распознаётся\n\
+                                 локально и переводится на русский. Клавиша C.\n\
+                                 Первый запуск — загрузка моделей (2–4 с).",
+                            )
+                            .clicked()
+                        {
+                            toggle_live = true;
+                        }
                     });
+                    if toggle_live {
+                        self.set_live(!self.subs_live);
+                    }
                 });
 
                 if !self.favorites.is_empty() {
@@ -1093,13 +1197,19 @@ impl eframe::App for TwitchMiniPlayer {
                             self.cancel_pending();
                         }
                     } else if playing {
-                        if ui.button("Остановить").clicked() {
+                        // Другой канал в поле — одна кнопка: сразу переключиться.
+                        // «Остановить» рядом с ней только запутала бы: клик по
+                        // «Воспроизвести» уже заменяет поток.
+                        if channel_changed {
+                            if ui
+                                .button("Воспроизвести")
+                                .on_hover_text("Включить канал из поля ввода")
+                                .clicked()
+                            {
+                                self.start_play();
+                            }
+                        } else if ui.button("Остановить").clicked() {
                             self.stop_stream();
-                        }
-                        // Пока играет другой канал — переключаемся одним кликом,
-                        // без предварительного «Остановить».
-                        if channel_changed && ui.button("Воспроизвести").clicked() {
-                            self.start_play();
                         }
                     } else if ui.button("Воспроизвести").clicked() {
                         self.start_play();
@@ -1114,20 +1224,32 @@ impl eframe::App for TwitchMiniPlayer {
                     }
                     ui.separator();
                     // Громкость меняется колесом мыши над видео — слайдера нет.
-                    ui.label(format!("Громкость: {}%", self.volume))
+                    ui.label(&self.volume_text)
                         .on_hover_text("Колесо мыши над видео — громкость");
                 });
+                if enter_play {
+                    self.start_play();
+                }
             }
 
             // Область видео. Кадр вписывается по своим пропорциям (из mpv, пока
             // потока нет — 16:9) и не растягивается: если после разворота окна
             // высоты не хватает, уменьшается и ширина, а по бокам остаются поля.
             // В полноэкранном режиме видео кадр занимает всё окно по центру.
-            let aspect = self
-                .player
-                .as_ref()
-                .and_then(|p| p.video_aspect())
-                .unwrap_or(16.0 / 9.0);
+            // Пропорции меняются только со сменой потока, поэтому свойство mpv
+            // читаем не чаще раза в 2 с: остальные кадры обходятся без FFI.
+            let aspect = match self.aspect_cache {
+                Some((a, at)) if at.elapsed() < Duration::from_secs(2) => a,
+                _ => {
+                    let a = self
+                        .player
+                        .as_ref()
+                        .and_then(|p| p.video_aspect())
+                        .unwrap_or(16.0 / 9.0);
+                    self.aspect_cache = Some((a, Instant::now()));
+                    a
+                }
+            };
             let rect;
             let rounding;
             if self.video_only {
@@ -1277,6 +1399,9 @@ impl eframe::App for TwitchMiniPlayer {
                 ui.ctx().request_repaint_after(Duration::from_millis(80));
             }
 
+            // Живые субтитры — поверх кадра, до чипов паузы и громкости.
+            self.draw_live_subs(ui, rect);
+
             // Чипы поверх кадра: пауза и громкость (после колеса).
             let mut chip_top = rect.top() + 14.0;
             if self.video_only
@@ -1307,6 +1432,9 @@ impl eframe::App for TwitchMiniPlayer {
             let hit = if self.video_only { ui.max_rect() } else { rect };
             let video_resp =
                 ui.interact(hit, egui::Id::new("video_area"), egui::Sense::click_and_drag());
+            // Мышь над видео — колесо меняет громкость, даже если окно не активно:
+            // плеер часто висит поверх других программ, и наводить на него
+            // специально никто не станет.
             if video_resp.hovered() {
                 let scroll = ui.input(|i| i.raw_scroll_delta.y);
                 if scroll.abs() > 0.0 {
@@ -1339,20 +1467,61 @@ impl eframe::App for TwitchMiniPlayer {
                 // ссылка на поток и метаданные живут в консоли разработчика.
                 ui.separator();
                 ui.label(&self.status);
+
+                // Пустое место снизу убираем: окно заканчивается строкой
+                // состояния. Размер меняем не чаще 4 раз в секунду, чтобы
+                // не спорить с пользователем, который тянет край окна.
+                if self.fit_window {
+                    let maximized = ui
+                        .ctx()
+                        .input(|i| i.viewport().maximized.unwrap_or(false));
+                    let extra = ui.available_height();
+                    let due = self
+                        .fit_at
+                        .map(|t| t.elapsed() >= Duration::from_millis(250))
+                        .unwrap_or(true);
+                    if !maximized && extra > 6.0 && due {
+                        if let Some(inner) = ui.ctx().input(|i| i.viewport().inner_rect) {
+                            // Оставляем место под отступ между элементами и
+                            // пару пикселей запаса: иначе строка состояния
+                            // упирается в край окна и подрезается.
+                            let cut = extra - ui.spacing().item_spacing.y - 2.0;
+                            if cut > 6.0 {
+                                let h = (inner.height() - cut).max(240.0);
+                                if inner.height() - h >= 1.0 {
+                                    if debug_enabled() {
+                                        debug_log(&format!(
+                                            "fit: лишнее {extra:.1} px, окно {:.1} → {h:.1}",
+                                            inner.height()
+                                        ));
+                                    }
+                                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::InnerSize(
+                                        egui::vec2(inner.width(), h),
+                                    ));
+                                    self.fit_at = Some(Instant::now());
+                                }
+                            }
+                        }
+                    }
+                }
             }
         });
 
         // Консоль разработчика — отдельным окном поверх плеера.
         if !self.video_only {
             self.dev_console(ctx);
+        } else if self.dev_panel {
+            // В полноэкранном режиме консоль не рисуется: отдельное окно
+            // осталось бы висеть без обновления — закрываем его.
+            self.dev_panel = false;
         }
 
         // Субтитры: захват звука процесса стартует/останавливается по настройке.
         self.subs.tick();
-        self.poll_asr();
-        self.poll_mt();
-        if self.subs.enabled {
-            // Индикатор уровня живой даже без кадров видео (audio-only поток).
+        // Живые субтитры: поток поднимается, когда есть захват звука.
+        self.ensure_live(ctx);
+        if self.dev_panel {
+            // Консоль показывает уровень звука и статус — обновляем чаще.
             ctx.request_repaint_after(Duration::from_millis(120));
         }
 
@@ -1374,11 +1543,32 @@ impl eframe::App for TwitchMiniPlayer {
             } else {
                 "не воспроизводится".to_string()
             };
-            tray::set_tooltip(&format!("Mini Twitch Player — {}", what));
+            // Строку собираем только когда она меняется: подсказка трея
+            // обновляется через Win32-сообщение, и дёргать его каждый кадр
+            // незачем.
+            if self.tray_tip != what {
+                self.tray_tip = what;
+                tray::set_tooltip(&format!("Mini Twitch Player — {}", self.tray_tip));
+            }
         }
 
         // Диагностика частоты перерисовки (только при TW_DEBUG_LOG).
         self.updates = self.updates.wrapping_add(1);
+        if self.subs.enabled
+            && self
+                .subs_log_at
+                .map(|t| t.elapsed() >= Duration::from_secs(5))
+                .unwrap_or(true)
+            && debug_enabled()
+        {
+            self.subs_log_at = Some(Instant::now());
+            let rms = self.subs.level().max(1e-6);
+            debug_log(&format!(
+                "subs: уровень {:.0} дБ, {}",
+                (20.0 * rms.log10()).max(-90.0),
+                self.subs.stats_line()
+            ));
+        }
         if self.updates % 300 == 0 && debug_enabled() {
             let dt = self
                 .last_update_at
@@ -1446,6 +1636,11 @@ impl TwitchMiniPlayer {
             tray: self.tray,
             pinned: self.pinned,
             subs_capture: self.subs.enabled,
+            subs_live: self.subs_live,
+            subs_translate: self.subs_translate,
+            subs_font: self.subs_font,
+            fit_window: self.fit_window,
+            dev_detached: self.dev_detached,
             client_id: self.client_id.clone(),
             window: self.saved_window,
         }
@@ -1624,7 +1819,15 @@ impl TwitchMiniPlayer {
 
     /// Применяет готовый JSON streamlink: обновляет качества и грузит поток в mpv.
     fn apply_resolved(&mut self, channel: &str, json: String) {
-        let key = match pick_stream_key(&json, &self.quality) {
+        // «Авто» не должно застревать в «только звук»: сохранённый `audio_only`
+        // (например, после просадки сети) оставил бы чёрное окно навсегда.
+        // Пустой приоритет = «выбери видео сам» по списку `pick_stream_key`.
+        let wanted = if self.auto_quality && is_audio_only(&self.quality) {
+            String::new()
+        } else {
+            self.quality.clone()
+        };
+        let key = match pick_stream_key(&json, &wanted) {
             Some(k) => k,
             None => {
                 self.error = Some("В потоке нет доступного качества (канал оффлайн?)".to_string());
@@ -1918,6 +2121,7 @@ impl TwitchMiniPlayer {
             return;
         }
         self.volume = next;
+        self.volume_text = format!("Громкость: {}%", next);
         if let Some(p) = &self.player {
             p.set_volume(next as i64);
         }
@@ -2065,14 +2269,135 @@ impl TwitchMiniPlayer {
         if !self.dev_panel {
             return;
         }
+        // Отдельное окно ОС: консоль можно утащить за пределы плеера.
+        if self.dev_detached {
+            let mut open = true;
+            ctx.show_viewport_immediate(
+                egui::ViewportId::from_hash_of("dev_console_viewport"),
+                egui::ViewportBuilder::default()
+                    .with_title("Консоль — Mini Twitch Player")
+                    .with_inner_size([480.0, 660.0])
+                    .with_min_inner_size([360.0, 300.0]),
+                |ctx, _class| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        egui::ScrollArea::vertical().show(ui, |ui| {
+                            self.dev_console_body(ui);
+                        });
+                    });
+                    if ctx.input(|i| i.viewport().close_requested()) {
+                        open = false;
+                    }
+                },
+            );
+            if !open {
+                self.dev_panel = false;
+                self.dev_detached = false;
+                self.settings_dirty = true;
+            }
+            return;
+        }
         let mut open = true;
-        egui::Window::new("Консоль разработчика")
+        egui::Window::new("Консоль")
             .open(&mut open)
             .default_pos(egui::pos2(120.0, 140.0))
-            .default_width(470.0)
+            .default_width(480.0)
             .resizable(true)
+            .vscroll(true)
             .show(ctx, |ui| {
-                ui.label(egui::RichText::new("Декодирование и отрисовка").strong());
+                self.dev_console_body(ui);
+            });
+        if !open {
+            self.dev_panel = false;
+        }
+    }
+
+    /// Содержимое консоли — одно и то же для панели и для отдельного окна.
+    fn dev_console_body(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            if ui
+                .selectable_label(self.dev_detached, "Отдельным окном")
+                .on_hover_text("Консоль откроется отдельным окном: его можно утащить за пределы плеера")
+                .clicked()
+            {
+                self.dev_detached = !self.dev_detached;
+                self.settings_dirty = true;
+            }
+            if ui.button("Закрыть").clicked() {
+                self.dev_panel = false;
+            }
+        });
+        ui.separator();
+
+        ui.label(egui::RichText::new("Субтитры").strong());
+        ui.horizontal(|ui| {
+            let label = if self.subs_live {
+                "Выключить (C)"
+            } else {
+                "Включить (C)"
+            };
+            if ui
+                .selectable_label(self.subs_live, label)
+                .on_hover_text(
+                    "Одна кнопка: включить — и у англоязычного стримера\n\
+                     идут русские субтитры поверх видео.",
+                )
+                .clicked()
+            {
+                self.set_live(!self.subs_live);
+            }
+            let mut tr = self.subs_translate;
+            if ui
+                .checkbox(&mut tr, "Перевод на русский (T)")
+                .on_hover_text("MarianMT opus-mt-en-ru, локально, без интернета")
+                .changed()
+            {
+                self.subs_translate = tr;
+                self.settings_dirty = true;
+            }
+            if ui
+                .add(egui::Slider::new(&mut self.subs_font, 14.0..=40.0).text("шрифт"))
+                .changed()
+            {
+                self.settings_dirty = true;
+            }
+        });
+        match &self.live {
+            Some(l) => {
+                let color = if l.error.is_some() {
+                    egui::Color32::from_rgb(255, 120, 120)
+                } else {
+                    egui::Color32::from_gray(170)
+                };
+                ui.label(egui::RichText::new(l.status_line()).small().color(color));
+                ui.label(
+                    egui::RichText::new(l.details_line())
+                        .small()
+                        .color(egui::Color32::from_gray(160)),
+                );
+                for line in l.recent(2) {
+                    ui.label(egui::RichText::new(line).small());
+                }
+                if let Some(err) = &l.error {
+                    ui.colored_label(egui::Color32::from_rgb(255, 120, 120), err);
+                }
+            }
+            None => {
+                ui.label(
+                    egui::RichText::new(if self.subs_live {
+                        "жду захват звука…"
+                    } else {
+                        "выключены"
+                    })
+                    .small()
+                    .weak(),
+                );
+            }
+        }
+
+        ui.separator();
+        egui::CollapsingHeader::new("Видео и декодирование")
+            .default_open(false)
+            .show(ui, |ui| {
                 let mut hwdec_changed = false;
                 let mut gpu_changed = false;
                 let mut profile_changed = false;
@@ -2147,10 +2472,15 @@ impl TwitchMiniPlayer {
                 }
 
                 ui.separator();
-                ui.label(egui::RichText::new("Субтитры · захват звука").strong());
+            });
+
+        // Захват звука — техническая часть: нужен только для диагностики.
+        egui::CollapsingHeader::new("Захват звука")
+            .default_open(false)
+            .show(ui, |ui| {
                 let mut subs_on = self.subs.enabled;
                 if ui
-                    .checkbox(&mut subs_on, "Захватывать звук стрима (эксперимент)")
+                    .checkbox(&mut subs_on, "Захватывать звук стрима")
                     .on_hover_text(
                         "Windows отдаёт звук только нашего процесса: музыка из браузера,\n\
                          игра и уведомления в субтитры не попадают.\n\
@@ -2159,6 +2489,10 @@ impl TwitchMiniPlayer {
                     .changed()
                 {
                     self.subs.set_enabled(subs_on);
+                    // Субтитрам без захвата нечего распознавать.
+                    if !subs_on {
+                        self.set_live(false);
+                    }
                     self.settings_dirty = true;
                 }
                 ui.horizontal(|ui| {
@@ -2193,75 +2527,21 @@ impl TwitchMiniPlayer {
                         .small()
                         .color(egui::Color32::from_gray(170)),
                 );
-                ui.horizontal(|ui| {
-                    let recording = self.subs.recording_secs();
-                    let text = match recording {
-                        Some(secs) => format!("Пишу… {secs:.1} с"),
-                        None => format!("Записать {:.0} с в WAV", subs::RECORD_SECS),
-                    };
-                    if ui
-                        .add_enabled(recording.is_none(), egui::Button::new(text))
-                        .on_hover_text(
-                            "Проверка захвата: в файле должен быть только звук стримера.\n\
-                             Файл: %APPDATA%\\twitch_mini_player\\capture.wav",
-                        )
-                        .clicked()
-                    {
-                        self.subs.start_recording();
+                if ui
+                    .button("Перезапустить захват")
+                    .on_hover_text(
+                        "Пригодится, если звук пропал или сменилось устройство вывода:\n\
+                         захват и распознавание поднимаются заново.",
+                    )
+                    .clicked()
+                {
+                    let live = self.subs_live;
+                    self.set_live(false);
+                    self.subs.set_enabled(false);
+                    self.subs.set_enabled(true);
+                    if live {
+                        self.set_live(true);
                     }
-                    if let Some(secs) = recording {
-                        ui.add(
-                            egui::ProgressBar::new(secs / subs::RECORD_SECS)
-                                .desired_width(110.0),
-                        );
-                    }
-                });
-                ui.horizontal(|ui| {
-                    let busy = self.asr_rx.is_some();
-                    let label = if busy { "Распознаю…" } else { "Распознать 10 с" };
-                    if ui
-                        .add_enabled(!busy && self.subs.is_running(), egui::Button::new(label))
-                        .on_hover_text(
-                            "whisper.cpp (CPU) распознаёт последние 10 секунд.\n\
-                             Модель: %APPDATA%\\twitch_mini_player\\models",
-                        )
-                        .clicked()
-                    {
-                        self.start_transcribe(10.0);
-                    }
-                    if busy {
-                        ui.spinner();
-                    }
-                });
-                if let Some(text) = &self.asr_text {
-                    ui.label(egui::RichText::new(text).strong());
-                    ui.horizontal(|ui| {
-                        let busy = self.mt_rx.is_some();
-                        let label = if busy { "Перевожу…" } else { "Перевести" };
-                        if ui
-                            .add_enabled(!busy, egui::Button::new(label))
-                            .on_hover_text("opus-mt-en-ru (ONNX, локально, без интернета)")
-                            .clicked()
-                        {
-                            self.start_translate();
-                        }
-                        if busy {
-                            ui.spinner();
-                        }
-                    });
-                }
-                if let Some(ru) = &self.mt_text {
-                    ui.label(
-                        egui::RichText::new(ru)
-                            .strong()
-                            .color(egui::Color32::from_rgb(150, 220, 255)),
-                    );
-                }
-                if let Some(err) = &self.asr_error {
-                    ui.colored_label(egui::Color32::from_rgb(255, 120, 120), err);
-                }
-                if let Some(err) = &self.mt_error {
-                    ui.colored_label(egui::Color32::from_rgb(255, 120, 120), err);
                 }
                 if let Some(err) = &self.subs.last_error {
                     ui.colored_label(egui::Color32::from_rgb(255, 120, 120), err);
@@ -2269,23 +2549,40 @@ impl TwitchMiniPlayer {
                 if let Some(note) = &self.subs.last_note {
                     ui.label(egui::RichText::new(note).small().weak());
                 }
+            });
 
-                ui.separator();
-                ui.label(egui::RichText::new("Диагностика").strong());
+        egui::CollapsingHeader::new("Окно и диагностика")
+            .default_open(false)
+            .show(ui, |ui| {
+                if ui
+                    .checkbox(&mut self.fit_window, "Окно по размеру видео")
+                    .on_hover_text(
+                        "Высота окна подгоняется под видео и строку состояния:\n\
+                         снизу не остаётся пустого места.",
+                    )
+                    .changed()
+                {
+                    self.settings_dirty = true;
+                }
                 self.refresh_stats();
                 ui.label(
                     egui::RichText::new(&self.stats_text)
                         .small()
                         .color(egui::Color32::from_gray(170)),
                 );
+            });
 
-                ui.separator();
-                ui.label(egui::RichText::new("Поток").strong());
+        egui::CollapsingHeader::new("Поток и метаданные")
+            .default_open(false)
+            .show(ui, |ui| {
                 match &self.stream_url {
                     Some(url) => {
-                        ui.add(egui::Label::new(
-                            egui::RichText::new(url.as_str()).small().monospace(),
-                        ));
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(url.as_str()).small().monospace(),
+                            )
+                            .truncate(),
+                        );
                         if ui.button("Копировать ссылку").clicked() {
                             ui.output_mut(|o| o.copied_text = url.clone());
                         }
@@ -2300,9 +2597,11 @@ impl TwitchMiniPlayer {
                     ui.label(format!("Зрителей: {}", meta.viewers));
                     ui.label(format!("Начало: {}", meta.started_at));
                 }
+            });
 
-                ui.separator();
-                ui.label(egui::RichText::new("Twitch API").strong());
+        egui::CollapsingHeader::new("Twitch API")
+            .default_open(false)
+            .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label("Client ID:");
                     if ui
@@ -2317,114 +2616,137 @@ impl TwitchMiniPlayer {
                         .small()
                         .weak(),
                 );
-
-                ui.separator();
-                if ui
-                    .button("Лучшие настройки")
-                    .on_hover_text(
-                        "GPU-декод, GPU-рендер, «Авто»-отрисовка и авто-качество —\n\
-                         минимум нагрузки на ПК и минимум задержки.",
-                    )
-                    .clicked()
-                {
-                    self.apply_best_settings();
-                }
-                ui.label(
-                    egui::RichText::new(format!(
-                        "v{} · лог: %TEMP%\\twitch_mini_player_debug.txt (TW_DEBUG_LOG=1)",
-                        APP_VERSION
-                    ))
-                    .small()
-                    .weak(),
-                );
             });
-        if !open {
-            self.dev_panel = false;
+
+        ui.separator();
+        if ui
+            .button("Лучшие настройки")
+            .on_hover_text(
+                "GPU-декод, GPU-рендер, «Авто»-отрисовка и авто-качество —\n\
+                 минимум нагрузки на ПК и минимум задержки.",
+            )
+            .clicked()
+        {
+            self.apply_best_settings();
+        }
+        ui.label(
+            egui::RichText::new(format!(
+                "v{} · лог: %TEMP%\\twitch_mini_player_debug.txt (TW_DEBUG_LOG=1)",
+                APP_VERSION
+            ))
+            .small()
+            .weak(),
+        );
+    }
+
+    /// Включает/выключает живые субтитры (кнопка «CC» или клавиша C).
+    fn set_live(&mut self, on: bool) {
+        if self.subs_live == on {
+            return;
+        }
+        self.subs_live = on;
+        self.settings_dirty = true;
+        if on {
+            // Без захвата нет звука: включаем и его, иначе режим будет пустым.
+            self.subs.set_enabled(true);
+            self.status = "Субтитры: загружаю модель…".to_string();
+        } else {
+            if let Some(mut l) = self.live.take() {
+                l.stop();
+            }
+            self.subs.set_live(false);
+            self.status = "Субтитры выключены".to_string();
         }
     }
 
-    /// Запускает распознавание последних `secs` секунд в фоне.
-    fn start_transcribe(&mut self, secs: f32) {
-        let samples = self.subs.last_samples(secs);
-        if samples.len() < asr::SAMPLE_RATE as usize {
-            self.asr_error =
-                Some("мало данных: включите захват и подождите пару секунд".to_string());
+    /// Держит поток субтитров запущенным и забирает готовые строки.
+    fn ensure_live(&mut self, ctx: &egui::Context) {
+        if !self.subs_live {
+            if let Some(mut l) = self.live.take() {
+                l.stop();
+            }
+            self.subs.set_live(false);
             return;
         }
-        let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            let res = match asr::Asr::new() {
-                Ok(engine) => engine.text(&samples),
-                Err(e) => Err(e),
-            };
-            let _ = tx.send(res);
-        });
-        self.asr_text = None;
-        self.asr_error = None;
-        self.asr_rx = Some(rx);
-    }
-
-    /// Забирает готовый результат распознавания (если он уже пришёл).
-    fn poll_asr(&mut self) {
-        let Some(rx) = &self.asr_rx else {
-            return;
-        };
-        match rx.try_recv() {
-            Ok(Ok(text)) => {
-                self.asr_text = Some(text);
-                self.asr_rx = None;
+        // Захват мог не подняться (нет Windows 11, ошибка WASAPI) или
+        // остановиться сам — тогда ждём, пока `subs.tick()` поднимет его снова.
+        let Some(shared) = self.subs.shared() else {
+            if let Some(mut l) = self.live.take() {
+                l.stop();
             }
-            Ok(Err(e)) => {
-                self.asr_error = Some(e);
-                self.asr_rx = None;
-            }
-            Err(mpsc::TryRecvError::Empty) => {}
-            Err(mpsc::TryRecvError::Disconnected) => {
-                self.asr_error = Some("поток распознавания завершился".to_string());
-                self.asr_rx = None;
-            }
-        }
-    }
-
-    /// Переводит распознанный текст в фоне (модель грузится в том же потоке).
-    fn start_translate(&mut self) {
-        let Some(text) = self.asr_text.clone() else {
-            self.mt_error = Some("сначала распознайте запись".to_string());
-            return;
-        };
-        let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            let res = match mt::Translator::new() {
-                Ok(mut tr) => tr.translate(&text),
-                Err(e) => Err(e),
-            };
-            let _ = tx.send(res);
-        });
-        self.mt_text = None;
-        self.mt_error = None;
-        self.mt_rx = Some(rx);
-    }
-
-    /// Забирает готовый перевод (если он уже пришёл).
-    fn poll_mt(&mut self) {
-        let Some(rx) = &self.mt_rx else {
             return;
         };
-        match rx.try_recv() {
-            Ok(Ok(text)) => {
-                self.mt_text = Some(text);
-                self.mt_rx = None;
-            }
-            Ok(Err(e)) => {
-                self.mt_error = Some(e);
-                self.mt_rx = None;
-            }
-            Err(mpsc::TryRecvError::Empty) => {}
-            Err(mpsc::TryRecvError::Disconnected) => {
-                self.mt_error = Some("поток перевода завершился".to_string());
-                self.mt_rx = None;
-            }
+        if self.live.is_none() {
+            crate::debug_log("live: запускаю поток субтитров");
+            self.live = Some(live::Live::start(shared, self.subs_translate));
+            self.subs.set_live(true);
         }
+        if let Some(l) = &self.live {
+            l.set_translate(self.subs_translate);
+        }
+        let mut changed = false;
+        if let Some(l) = &mut self.live {
+            changed = l.poll();
+        }
+        if changed {
+            ctx.request_repaint();
+        }
+        // Кадры видео и так будят интерфейс, а таймер нужен только там, где
+        // кадров нет (поток «только звук»): иначе окно просыпалось бы зря.
+        let playing = self
+            .player
+            .as_ref()
+            .map(|p| p.is_playing())
+            .unwrap_or(false);
+        if !playing {
+            ctx.request_repaint_after(Duration::from_millis(200));
+        }
+    }
+
+    /// Рисует субтитры внизу кадра одной строкой.
+    ///
+    /// Вторая (предыдущая) строка убрана: рядом с текущей она читается как
+    /// второй говорящий, а в стриме говорит один человек. Пока фраза ещё
+    /// распознаётся, строка бледнее — видно, что текст допишется.
+    fn draw_live_subs(&self, ui: &egui::Ui, rect: egui::Rect) {
+        if !self.subs_live || rect.width() < 120.0 {
+            return;
+        }
+        let Some(l) = &self.live else {
+            return;
+        };
+        let Some(line) = l.overlay() else {
+            return;
+        };
+        let painter = ui.painter();
+        let base = self.subs_font.clamp(12.0, 44.0);
+        // Ширина — по кадру, но не впритык к краям.
+        let max_w = (rect.width() * 0.86).max(80.0);
+        let bottom = rect.bottom() - (rect.height() * 0.06).max(10.0);
+
+        let text_color = if line.partial {
+            egui::Color32::from_gray(215)
+        } else {
+            egui::Color32::WHITE
+        };
+        let galley = painter.layout(
+            line.text,
+            egui::FontId::proportional(base),
+            text_color,
+            max_w,
+        );
+        let pos = egui::pos2(
+            rect.center().x - galley.size().x / 2.0,
+            bottom - galley.size().y,
+        );
+        // Полупрозрачная подложка: текст читается и на светлом кадре.
+        let bg = egui::Rect::from_min_size(pos, galley.size()).expand2(egui::vec2(14.0, 7.0));
+        painter.rect_filled(
+            bg,
+            egui::Rounding::same(8.0),
+            egui::Color32::from_black_alpha(if line.partial { 120 } else { 165 }),
+        );
+        painter.galley(pos, galley, text_color);
     }
 
     /// Собирает строку статистики (не чаще 2 раз в секунду).
@@ -2708,7 +3030,13 @@ impl TwitchMiniPlayer {
     /// Понижает качество на один уровень. `true`, если переключили.
     fn step_quality_down(&mut self, reason: &str) -> bool {
         let list = self.qualities.clone();
-        let Some(next) = neighbor_quality(&list, &self.quality, true) else {
+        let Some(next) = lower_video_quality(&list, &self.quality) else {
+            // Ниже самого низкого видео не уходим: в «только звук» окно
+            // станет чёрным, а это выглядит как поломка плеера.
+            debug_log(&format!(
+                "авто: {} — {} и так минимальное видео, ниже не понижаю",
+                reason, self.quality
+            ));
             return false;
         };
         debug_log(&format!("авто: {} — {} → {}", reason, self.quality, next));
@@ -2922,6 +3250,19 @@ fn neighbor_quality(list: &[String], current: &str, down: bool) -> Option<String
     }
 }
 
+/// Куда «Авто» может понизить качество: на уровень ниже, но не в «только звук».
+///
+/// Переход в `audio_only` на ходу оставляет чёрное окно без объяснения, а
+/// субтитры и звук работают и на самом низком видео. Ниже него авто-понижение
+/// останавливается — поток просто переподключается.
+fn lower_video_quality(list: &[String], current: &str) -> Option<String> {
+    let next = neighbor_quality(list, current, true)?;
+    if is_audio_only(&next) {
+        return None;
+    }
+    Some(next)
+}
+
 /// Высота качества из имени (`720p60` → 720). `None` для `source`/`best`.
 fn quality_height(q: &str) -> Option<u32> {
     let pos = q.find('p')?;
@@ -3058,6 +3399,38 @@ mod tests {
     }
 
     #[test]
+    fn auto_does_not_stick_to_audio_only() {
+        // Пустой приоритет («Авто» без сохранённого качества) — всегда видео,
+        // иначе окно остаётся чёрным после просадки сети.
+        let json = r#"{"streams":{"audio_only":{"url":"a"},"480p30":{"url":"x"}}}"#;
+        assert_eq!(pick_stream_key(json, "").as_deref(), Some("480p30"));
+        // Если видео в потоке нет — «только звук» остаётся единственным вариантом.
+        let audio = r#"{"streams":{"audio_only":{"url":"a"}}}"#;
+        assert_eq!(pick_stream_key(audio, "").as_deref(), Some("audio_only"));
+    }
+
+    #[test]
+    fn auto_drop_stops_at_lowest_video_quality() {
+        let list: Vec<String> = ["audio_only", "160p30", "480p30", "720p60"]
+            .iter()
+            .map(|q| q.to_string())
+            .collect();
+        // Обычный шаг вниз — как у `neighbor_quality`.
+        assert_eq!(
+            lower_video_quality(&list, "720p60").as_deref(),
+            Some("480p30")
+        );
+        assert_eq!(
+            lower_video_quality(&list, "480p30").as_deref(),
+            Some("160p30")
+        );
+        // Дальше — только звук: авто-режим на это не идёт, окно стало бы чёрным.
+        assert_eq!(lower_video_quality(&list, "160p30"), None);
+        // Из «только звук» понижать некуда.
+        assert_eq!(lower_video_quality(&list, "audio_only"), None);
+    }
+
+    #[test]
     fn auto_quality_matches_bandwidth() {
         // Требования уровней растут монотонно.
         assert!(quality_bitrate_mbps("audio_only") < quality_bitrate_mbps("160p30"));
@@ -3112,6 +3485,26 @@ mod tests {
             auto_profile(false, AUTO_PROFILE_SLOW_MS),
             RENDER_PROFILES.len() - 1
         );
+    }
+
+    #[test]
+    fn settings_with_bom_are_read() {
+        let json = "\u{feff}{\"channel\": \"somebody\", \"subs_live\": true}";
+        let s = parse_settings(json);
+        assert_eq!(s.channel, "somebody");
+        assert!(s.subs_live);
+        // Новые настройки по умолчанию включают подгонку окна: пустого места
+        // под видео быть не должно, даже если файл настроек старый.
+        assert!(s.fit_window);
+        assert!(!s.dev_detached);
+        let json = "{\"fit_window\": false, \"dev_detached\": true}";
+        let s = parse_settings(json);
+        assert!(!s.fit_window);
+        assert!(s.dev_detached);
+        // Битый текст не мешает запуску.
+        let s = parse_settings("{ broken");
+        assert_eq!(s.channel, Settings::default().channel);
+        assert!(s.fit_window);
     }
 
     #[test]
@@ -3220,7 +3613,7 @@ fn settings_path() -> std::path::PathBuf {
 fn load_settings() -> Settings {
     let mut s: Settings = std::fs::read_to_string(settings_path())
         .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
+        .map(|t| parse_settings(&t))
         .unwrap_or_default();
     if s.version < SETTINGS_VERSION {
         let best = Settings::default();
@@ -3237,6 +3630,13 @@ fn save_settings(s: &Settings) {
     if let Ok(text) = serde_json::to_string_pretty(s) {
         let _ = std::fs::write(settings_path(), text);
     }
+}
+
+/// Разбор `settings.json`: BOM не мешает, битый текст даёт значения по умолчанию.
+fn parse_settings(text: &str) -> Settings {
+    // Блокнот и PowerShell сохраняют файл с BOM — serde_json на нём падает, и
+    // настройки молча сбрасывались бы в значения по умолчанию.
+    serde_json::from_str(text.trim_start_matches('\u{feff}')).unwrap_or_default()
 }
 
 fn load_favorites() -> Vec<String> {
